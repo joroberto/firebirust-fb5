@@ -23,6 +23,7 @@ percent-encoding = "2.1"
 chrono = "0.4"
 chrono-tz = "0.6"
 urlencoding = "2.1"
+flate2 = "1.0"
 
 [dependencies.async-std]
 version = "1.13"

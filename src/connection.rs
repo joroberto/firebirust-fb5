@@ -186,6 +186,14 @@ impl Connection {
         Ok(())
     }
 
+    /// Commit and finalize the transaction (for Transaction struct)
+    pub(crate) fn _commit_final(&self, trans_handle: i32) -> Result<(), Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.op_commit(trans_handle)?;
+        wp.op_response()?;
+        Ok(())
+    }
+
     pub fn commit(&self) -> Result<(), Error> {
         self._commit(self.trans_handle)
     }
@@ -197,9 +205,24 @@ impl Connection {
         Ok(trans_handle)
     }
 
+    pub(crate) fn _begin_trans_with_options(&mut self, options: &super::transaction::TransactionOptions) -> Result<i32, Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.op_transaction_with_options(options)?;
+        let (trans_handle, _, _) = wp.op_response()?;
+        Ok(trans_handle)
+    }
+
     pub(crate) fn _rollback(&mut self, trans_handle: i32) -> Result<(), Error> {
         let mut wp = self.wp.borrow_mut();
         wp.op_rollback_retaining(trans_handle)?;
+        wp.op_response()?;
+        Ok(())
+    }
+
+    /// Rollback and finalize the transaction (for Transaction struct)
+    pub(crate) fn _rollback_final(&mut self, trans_handle: i32) -> Result<(), Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.op_rollback(trans_handle)?;
         wp.op_response()?;
         Ok(())
     }
@@ -208,7 +231,7 @@ impl Connection {
         self._rollback(self.trans_handle)
     }
 
-    pub fn _prepare(&mut self, query: &str, trans_handle: i32) -> Result<Statement<'_>, Error> {
+    pub fn _prepare(&mut self, query: &str, trans_handle: i32, autocommit: bool) -> Result<Statement<'_>, Error> {
         let mut wp = self.wp.borrow_mut();
         wp.op_allocate_statement()?;
 
@@ -235,16 +258,26 @@ impl Connection {
             stmt_handle,
             stmt_type,
             xsqlda,
-            true, // autocommit is true
+            autocommit,
         ))
     }
 
     pub fn prepare(&mut self, query: &str) -> Result<Statement<'_>, Error> {
-        self._prepare(query, self.trans_handle)
+        self._prepare(query, self.trans_handle, true)
+    }
+
+    /// Prepare a statement without autocommit (for use in transactions)
+    pub fn prepare_no_autocommit(&mut self, query: &str) -> Result<Statement<'_>, Error> {
+        self._prepare(query, self.trans_handle, false)
     }
 
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         Transaction::new(self)
+    }
+
+    /// Start a transaction with custom options (isolation level, lock wait, etc.)
+    pub fn transaction_with_options(&mut self, options: super::transaction::TransactionOptions) -> Result<Transaction<'_>, Error> {
+        Transaction::with_options(self, options)
     }
 
     // methods for Statement
@@ -297,5 +330,27 @@ impl Connection {
         let mut wp = self.wp.borrow_mut();
         wp.op_rollback(trans_handle).unwrap();
         wp.op_response().unwrap();
+    }
+
+    // ===== Event Methods (POST_EVENT support) =====
+
+    /// Queue events for notification
+    /// Returns an event_id that can be used with wait_for_event and cancel_events
+    pub fn queue_events(&self, event_buffer: &[u8]) -> Result<i32, Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.op_que_events(event_buffer)
+    }
+
+    /// Wait for an event notification with timeout
+    /// Returns Some(result_buffer) if event fired, None if timeout
+    pub fn wait_for_event(&self, _event_id: i32, timeout_ms: u32) -> Result<Option<Vec<u8>>, Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.wait_for_event(timeout_ms)
+    }
+
+    /// Cancel previously queued events
+    pub fn cancel_events(&self, event_id: i32) -> Result<(), Error> {
+        let mut wp = self.wp.borrow_mut();
+        wp.op_cancel_events(event_id)
     }
 }

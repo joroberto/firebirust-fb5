@@ -83,6 +83,9 @@ impl ConnParams {
         options
             .entry(String::from("page_size"))
             .or_insert("4096".to_string());
+        options
+            .entry(String::from("compress"))
+            .or_insert("false".to_string());
         Ok((
             ConnParams {
                 host,

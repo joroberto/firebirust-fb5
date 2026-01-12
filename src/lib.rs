@@ -21,7 +21,9 @@
 // SOFTWARE.
 #![allow(dead_code)]
 
+mod alerter;
 mod cellvalue;
+mod compression;
 mod conn_params;
 mod connection;
 mod crypt_translater;
@@ -30,6 +32,7 @@ mod errmsgs;
 mod error;
 mod param;
 mod params;
+pub mod pool;
 mod row;
 mod srp;
 mod statement;
@@ -46,11 +49,14 @@ mod transaction_async;
 mod wirechannel_async;
 mod wireprotocol_async;
 
+pub use crate::alerter::{EventAlerter, MAX_EVENTS};
 pub use crate::connection::Connection;
 pub use crate::connection_async::ConnectionAsync;
-pub use crate::error::Error;
+pub use crate::error::{Error, ValueError};
 pub use crate::param::Param;
 pub use crate::param::ToSqlParam;
+pub use crate::pool::{ConnectionPool, PoolOptions, PoolGuard};
+pub use crate::transaction::{IsolationLevel, LockWait, TransactionOptions};
 
 // Column type
 pub const SQL_TYPE_TEXT: u32 = 452;
@@ -67,6 +73,8 @@ pub const SQL_TYPE_QUAD: u32 = 550;
 pub const SQL_TYPE_TIME: u32 = 560;
 pub const SQL_TYPE_DATE: u32 = 570;
 pub const SQL_TYPE_INT64: u32 = 580;
+pub const SQL_TYPE_TIMESTAMP_TZ_EX: u32 = 32748;  // Extended timestamp with timezone (Firebird 4+)
+pub const SQL_TYPE_TIME_TZ_EX: u32 = 32750;       // Extended time with timezone (Firebird 4+)
 pub const SQL_TYPE_INT128: u32 = 32752;
 pub const SQL_TYPE_TIMESTAMP_TZ: u32 = 32754;
 pub const SQL_TYPE_TIME_TZ: u32 = 32756;
@@ -318,29 +326,31 @@ pub(crate) const CNCT_LOGIN: u8 = 9;
 pub(crate) const CNCT_PLUGIN_LIST: u8 = 10;
 pub(crate) const CNCT_CLIENT_CRYPT: u8 = 11;
 
-pub(crate) const ISC_TPB_VERSION1: u8 = 1;
-pub(crate) const ISC_TPB_VERSION3: u8 = 3;
-pub(crate) const ISC_TPB_CONSISTENCY: u8 = 1;
-pub(crate) const ISC_TPB_CONCURRENCY: u8 = 2;
-pub(crate) const ISC_TPB_SHARED: u8 = 3;
-pub(crate) const ISC_TPB_PROTECTED: u8 = 4;
-pub(crate) const ISC_TPB_EXCLUSIVE: u8 = 5;
-pub(crate) const ISC_TPB_WAIT: u8 = 6;
-pub(crate) const ISC_TPB_NOWAIT: u8 = 7;
-pub(crate) const ISC_TPB_READ: u8 = 8;
-pub(crate) const ISC_TPB_WRITE: u8 = 9;
-pub(crate) const ISC_TPB_LOCK_READ: u8 = 10;
-pub(crate) const ISC_TPB_LOCK_WRITE: u8 = 11;
-pub(crate) const ISC_TPB_VERB_TIME: u8 = 12;
-pub(crate) const ISC_TPB_COMMIT_TIME: u8 = 13;
-pub(crate) const ISC_TPB_IGNORE_LIMBO: u8 = 14;
-pub(crate) const ISC_TPB_READ_COMMITTED: u8 = 15;
-pub(crate) const ISC_TPB_AUTOCOMMIT: u8 = 16;
-pub(crate) const ISC_TPB_REC_VERSION: u8 = 17;
-pub(crate) const ISC_TPB_NO_REC_VERSION: u8 = 18;
-pub(crate) const ISC_TPB_RESTART_REQUESTS: u8 = 19;
-pub(crate) const ISC_TPB_NO_AUTO_UNDO: u8 = 20;
-pub(crate) const ISC_TPB_LOCK_TIMEOUT: u8 = 21;
+// Transaction Parameter Block (TPB) constants - public for custom transaction configuration
+pub const ISC_TPB_VERSION1: u8 = 1;
+pub const ISC_TPB_VERSION3: u8 = 3;
+pub const ISC_TPB_CONSISTENCY: u8 = 1;    // Serializable isolation
+pub const ISC_TPB_CONCURRENCY: u8 = 2;    // Snapshot isolation
+pub const ISC_TPB_SHARED: u8 = 3;
+pub const ISC_TPB_PROTECTED: u8 = 4;
+pub const ISC_TPB_EXCLUSIVE: u8 = 5;
+pub const ISC_TPB_WAIT: u8 = 6;           // Wait for locks
+pub const ISC_TPB_NOWAIT: u8 = 7;         // Fail immediately if lock unavailable
+pub const ISC_TPB_READ: u8 = 8;           // Read-only access
+pub const ISC_TPB_WRITE: u8 = 9;          // Read-write access
+pub const ISC_TPB_LOCK_READ: u8 = 10;
+pub const ISC_TPB_LOCK_WRITE: u8 = 11;
+pub const ISC_TPB_VERB_TIME: u8 = 12;
+pub const ISC_TPB_COMMIT_TIME: u8 = 13;
+pub const ISC_TPB_IGNORE_LIMBO: u8 = 14;
+pub const ISC_TPB_READ_COMMITTED: u8 = 15;
+pub const ISC_TPB_AUTOCOMMIT: u8 = 16;
+pub const ISC_TPB_REC_VERSION: u8 = 17;   // Record versioning (optimistic)
+pub const ISC_TPB_NO_REC_VERSION: u8 = 18; // No record versioning (pessimistic)
+pub const ISC_TPB_RESTART_REQUESTS: u8 = 19;
+pub const ISC_TPB_NO_AUTO_UNDO: u8 = 20;
+pub const ISC_TPB_LOCK_TIMEOUT: u8 = 21;
+pub const ISC_TPB_READ_CONSISTENCY: u8 = 22; // Read consistency (Firebird 4+)
 
 pub(crate) const ISC_INFO_REQ_SELECT_COUNT: u32 = 13;
 pub(crate) const ISC_INFO_REQ_INSERT_COUNT: u32 = 14;

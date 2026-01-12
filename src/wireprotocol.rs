@@ -35,7 +35,7 @@ use super::xsqlvar::XSQLVar;
 use super::*;
 
 const PLUGIN_NAME_LIST: &str = "Srp256,Srp";
-const BUFFER_LEN: u32 = 1024;
+const BUFFER_LEN: u32 = 8192;
 const MAX_CHAR_LENGTH: usize = 32767;
 const BLOB_SEGMENT_SIZE: usize = 32000;
 
@@ -161,6 +161,7 @@ impl WireProtocol {
 
     fn send_packets(&mut self) -> Result<(), Error> {
         self.channel.write(&self.write_buf)?;
+        self.channel.flush()?;
         self.write_buf.clear();
         Ok(())
     }
@@ -350,6 +351,14 @@ impl WireProtocol {
             self.op_response()?;
         } else {
             self.auth_data = Some(auth_data); // use in op_attach(), op_create()
+        }
+
+        // Enable compression if negotiated
+        // Compression must be enabled AFTER encryption setup (encryption wraps compressed data)
+        let want_compress = options.get("compress").map_or(false, |v| v == "true" || v == "1");
+        if want_compress && (self.accept_type & PFLAG_COMPRESS) != 0 {
+            debug_print!("Wire compression enabled");
+            self.channel.enable_compression();
         }
 
         Ok(())
@@ -544,14 +553,14 @@ impl WireProtocol {
         client_public: &BigInt,
     ) -> Result<(), Error> {
         debug_print!("op_connect()");
-        // PROTOCOL_VERSION, Arch type (Generic=1), min, max, weight
-        let protocols = [
-            "ffff800d00000001000000000000000500000008", // 13, 1, 0, 5, 8
-            "ffff800e0000000100000000000000050000000a", // 14, 1, 0, 5, 10
-            "ffff800f0000000100000000000000050000000c", // 15, 1, 0, 5, 12
-            "ffff80100000000100000000000000050000000e", // 16, 1, 0, 5, 14
-            "ffff801100000001000000000000000500000010", // 17, 1, 0, 5, 16
-        ];
+
+        // Check if compression is requested
+        let want_compress = options.get("compress").map_or(false, |v| v == "true" || v == "1");
+
+        // Build protocol entries
+        // Format: version(4), arch(4), min_type(4), max_type(4), weight(4)
+        let protocols = self.build_protocol_list(want_compress);
+
         self.pack_u32(OP_CONNECT);
         self.pack_u32(OP_ATTACH);
         self.pack_u32(3); // CONNECT_VERSION3
@@ -566,12 +575,48 @@ impl WireProtocol {
             client_public,
         ));
 
-        for p in protocols.iter() {
-            self.append_bytes(&hex::decode(p).unwrap());
+        for p in protocols {
+            self.append_bytes(&p);
         }
         self.send_packets()?;
 
         Ok(())
+    }
+
+    /// Build protocol list with optional compression support
+    fn build_protocol_list(&self, want_compress: bool) -> Vec<Vec<u8>> {
+        // Protocol versions we support: 13-17
+        // Each entry: version (negated), arch_type, min_type, max_type, weight
+        let versions = [
+            (13, 8),  // version 13, weight 8
+            (14, 10), // version 14, weight 10
+            (15, 12), // version 15, weight 12
+            (16, 14), // version 16, weight 14
+            (17, 16), // version 17, weight 16
+        ];
+
+        let arch_type: u32 = 1; // Generic
+        let min_type: u32 = 0;
+        let base_max_type: u32 = PTYPE_LAZY_SEND;
+
+        // Add PFLAG_COMPRESS to max_type if compression is wanted
+        let max_type = if want_compress {
+            base_max_type | PFLAG_COMPRESS
+        } else {
+            base_max_type
+        };
+
+        versions.iter().map(|(ver, weight)| {
+            let mut entry = Vec::with_capacity(20);
+            // Version is sent as negated value with high bit set
+            let ver_bytes = (0xffff8000u32 | (*ver as u32)).to_be_bytes();
+            entry.extend_from_slice(&ver_bytes);
+            entry.extend_from_slice(&arch_type.to_be_bytes());
+            entry.extend_from_slice(&min_type.to_be_bytes());
+            entry.extend_from_slice(&max_type.to_be_bytes());
+            entry.extend_from_slice(&(*weight as u32).to_be_bytes());
+            entry
+        }).collect()
     }
 
     pub fn op_create(
@@ -741,6 +786,77 @@ impl WireProtocol {
         self.send_packets()?;
 
         Ok(())
+    }
+
+    /// Start a transaction with custom options (isolation level, lock wait, etc.)
+    pub fn op_transaction_with_options(&mut self, options: &crate::transaction::TransactionOptions) -> Result<(), Error> {
+        debug_print!("op_transaction_with_options()");
+        let tpb = self.build_tpb(options);
+
+        self.pack_u32(OP_TRANSACTION);
+        self.pack_u32(self.db_handle as u32);
+        self.pack_bytes(&tpb);
+        self.send_packets()?;
+
+        Ok(())
+    }
+
+    /// Build Transaction Parameter Block (TPB) from options
+    fn build_tpb(&self, options: &crate::transaction::TransactionOptions) -> Vec<u8> {
+        use crate::transaction::{IsolationLevel, LockWait};
+
+        let mut tpb = vec![ISC_TPB_VERSION3];
+
+        // Access mode
+        if options.read_only {
+            tpb.push(ISC_TPB_READ);
+        } else {
+            tpb.push(ISC_TPB_WRITE);
+        }
+
+        // Lock wait behavior
+        match options.lock_wait {
+            LockWait::Wait => tpb.push(ISC_TPB_WAIT),
+            LockWait::NoWait => tpb.push(ISC_TPB_NOWAIT),
+            LockWait::Timeout(secs) => {
+                tpb.push(ISC_TPB_LOCK_TIMEOUT);
+                // Lock timeout is sent as 4-byte little-endian integer
+                tpb.push(4); // length
+                tpb.extend_from_slice(&(secs as i32).to_le_bytes());
+            }
+        }
+
+        // Isolation level
+        match options.isolation_level {
+            IsolationLevel::ReadCommitted => {
+                tpb.push(ISC_TPB_READ_COMMITTED);
+                tpb.push(ISC_TPB_REC_VERSION);
+            }
+            IsolationLevel::ReadCommittedNoRecVersion => {
+                tpb.push(ISC_TPB_READ_COMMITTED);
+                tpb.push(ISC_TPB_NO_REC_VERSION);
+            }
+            IsolationLevel::ReadCommittedReadOnly => {
+                tpb.push(ISC_TPB_READ_COMMITTED);
+                tpb.push(ISC_TPB_REC_VERSION);
+                // read_only flag already handled above
+            }
+            IsolationLevel::Snapshot => {
+                tpb.push(ISC_TPB_CONCURRENCY);
+            }
+            IsolationLevel::SnapshotReadOnly => {
+                tpb.push(ISC_TPB_CONCURRENCY);
+                // read_only flag already handled above
+            }
+            IsolationLevel::Serializable => {
+                tpb.push(ISC_TPB_CONSISTENCY);
+            }
+            IsolationLevel::ReadConsistency => {
+                tpb.push(ISC_TPB_READ_CONSISTENCY);
+            }
+        }
+
+        tpb
     }
 
     pub fn op_commit(&mut self, trans_handle: i32) -> Result<(), Error> {
@@ -1094,6 +1210,95 @@ impl WireProtocol {
         self.pack_u32(blob_handle as u32);
         self.send_packets()?;
         Ok(())
+    }
+
+    // ===== Event Operations =====
+
+    /// Queue events for notification (POST_EVENT support)
+    pub fn op_que_events(&mut self, event_buffer: &[u8]) -> Result<i32, Error> {
+        debug_print!("op_que_events()");
+
+        // Generate a unique event ID
+        static EVENT_ID_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+        let event_id = EVENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        self.pack_u32(OP_QUE_EVENTS);
+        self.pack_u32(self.db_handle as u32);
+        self.pack_bytes(event_buffer);
+        self.pack_u32(0); // ast (callback) - not used in wire protocol
+        self.pack_u32(0); // arg - not used in wire protocol
+        self.pack_u32(event_id as u32);
+        self.send_packets()?;
+
+        // Get response - the handle in response is the actual event_id assigned by server
+        let (server_event_id, _, _) = self.op_response()?;
+        Ok(server_event_id)
+    }
+
+    /// Cancel previously queued events
+    pub fn op_cancel_events(&mut self, event_id: i32) -> Result<(), Error> {
+        debug_print!("op_cancel_events()");
+        self.pack_u32(OP_CANCEL_EVENTS);
+        self.pack_u32(self.db_handle as u32);
+        self.pack_u32(event_id as u32);
+        self.send_packets()?;
+        self.op_response()?;
+        Ok(())
+    }
+
+    /// Wait for event notification with timeout
+    /// Returns Some(result_buffer) if event fired, None if timeout
+    pub fn wait_for_event(&mut self, timeout_ms: u32) -> Result<Option<Vec<u8>>, Error> {
+        debug_print!("wait_for_event(timeout={})", timeout_ms);
+
+        // Set socket read timeout
+        self.channel.set_read_timeout(Some(std::time::Duration::from_millis(timeout_ms as u64)))?;
+
+        // Try to receive opcode
+        let result = self.recv_packets(4);
+
+        // Reset timeout to blocking
+        self.channel.set_read_timeout(None)?;
+
+        match result {
+            Ok(opcode_bytes) => {
+                let mut opcode = utils::bytes_to_buint32(&opcode_bytes);
+                while opcode == OP_DUMMY {
+                    opcode = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                }
+
+                if opcode == OP_EVENT {
+                    // Parse event response
+                    let _db_handle = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                    let buf_len = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                    let result_buffer = self.recv_packets_alignment(buf_len as usize)?;
+                    let _ast = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                    let _arg = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                    let _event_id = utils::bytes_to_buint32(&self.recv_packets(4)?);
+                    Ok(Some(result_buffer))
+                } else if opcode == OP_RESPONSE {
+                    // May be an error or other response
+                    self.parse_op_response()?;
+                    Ok(None)
+                } else {
+                    Err(Error::PoolError(format!(
+                        "Unexpected opcode {} waiting for event",
+                        opcode
+                    )))
+                }
+            }
+            Err(e) => {
+                // Check if it's a timeout error
+                if let Error::IoError(ref io_err) = e {
+                    if io_err.kind() == std::io::ErrorKind::WouldBlock
+                        || io_err.kind() == std::io::ErrorKind::TimedOut
+                    {
+                        return Ok(None); // Timeout, no event
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn op_response(&mut self) -> Result<(i32, Vec<u8>, Vec<u8>), Error> {

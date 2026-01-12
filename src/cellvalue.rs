@@ -80,11 +80,16 @@ impl CellValueToVal<String> for CellValue {
 
 impl CellValueToVal<i64> for CellValue {
     fn to_val(self) -> Result<i64, Error> {
+        use rust_decimal::prelude::ToPrimitive;
         match self {
             CellValue::Short(v) => Ok(v.into()),
             CellValue::Long(v) => Ok(v.into()),
-            CellValue::Int64(v) => Ok(v.into()),
-            _ => Err(Error::ValueError(ValueError::new("Can't convert int"))),
+            CellValue::Int64(v) => Ok(v),
+            CellValue::Int128(v) => Ok(v as i64),
+            CellValue::Decimal(v) => v.to_i64().ok_or_else(|| {
+                Error::ValueError(ValueError::new("Can't convert decimal to i64"))
+            }),
+            _ => Err(Error::ValueError(ValueError::new("Can't convert to int"))),
         }
     }
 }
@@ -103,18 +108,34 @@ impl CellValueToVal<i16> for CellValue {
 
 impl CellValueToVal<f64> for CellValue {
     fn to_val(self) -> Result<f64, Error> {
+        use rust_decimal::prelude::ToPrimitive;
         match self {
             CellValue::Double(v) => Ok(v),
-            _ => Err(Error::ValueError(ValueError::new("Can't convert double"))),
+            CellValue::Float(v) => Ok(v as f64),
+            CellValue::Decimal(v) => v.to_f64().ok_or_else(|| {
+                Error::ValueError(ValueError::new("Can't convert decimal to f64"))
+            }),
+            CellValue::Short(v) => Ok(v as f64),
+            CellValue::Long(v) => Ok(v as f64),
+            CellValue::Int64(v) => Ok(v as f64),
+            _ => Err(Error::ValueError(ValueError::new("Can't convert to f64"))),
         }
     }
 }
 
 impl CellValueToVal<f32> for CellValue {
     fn to_val(self) -> Result<f32, Error> {
+        use rust_decimal::prelude::ToPrimitive;
         match self {
             CellValue::Float(v) => Ok(v),
-            _ => Err(Error::ValueError(ValueError::new("Can't convert float"))),
+            CellValue::Double(v) => Ok(v as f32),
+            CellValue::Decimal(v) => v.to_f32().ok_or_else(|| {
+                Error::ValueError(ValueError::new("Can't convert decimal to f32"))
+            }),
+            CellValue::Short(v) => Ok(v as f32),
+            CellValue::Long(v) => Ok(v as f32),
+            CellValue::Int64(v) => Ok(v as f32),
+            _ => Err(Error::ValueError(ValueError::new("Can't convert to f32"))),
         }
     }
 }

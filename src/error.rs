@@ -30,6 +30,8 @@ pub enum Error {
     ValueError(ValueError),
     ParamError(ParamError),
     UrlError(UrlError),
+    PoolTimeout,
+    PoolError(String),
 }
 
 impl From<UrlError> for Error {

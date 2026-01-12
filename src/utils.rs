@@ -71,11 +71,13 @@ pub fn int16_to_bytes(i: u16) -> [u8; 2] {
 }
 
 pub fn f32_to_bytes(f: f32) -> [u8; 4] {
-    f.to_le_bytes()
+    // Firebird wire protocol uses big-endian for floats
+    f.to_be_bytes()
 }
 
 pub fn f64_to_bytes(f: f64) -> [u8; 8] {
-    f.to_le_bytes()
+    // Firebird wire protocol uses big-endian for floats
+    f.to_be_bytes()
 }
 
 pub fn bytes_to_str(b: &[u8]) -> String {
@@ -225,7 +227,7 @@ pub fn bytes_to_naive_time(b: &[u8]) -> chrono::NaiveTime {
     let h = m / 60;
     m = m % 60;
     s = s % 60;
-    chrono::NaiveTime::from_hms_micro_opt(h, m, s, (n % 10000) * 100000).unwrap()
+    chrono::NaiveTime::from_hms_nano_opt(h, m, s, (n % 10000) * 100000).unwrap()
 }
 
 pub fn bytes_to_time_tz(b: &[u8]) -> (chrono::NaiveTime, chrono_tz::Tz) {
@@ -352,8 +354,9 @@ pub fn convert_date(year: i32, month: u32, day: u32) -> [u8; 4] {
 }
 
 pub fn convert_time(hour: u32, minute: u32, second: u32, nanosecond: u32) -> [u8; 4] {
-    // Convert time to BLR format time
-    let n = (hour * 3600 + minute * 60 + second) * 10000 + nanosecond * 10;
+    // Convert time to BLR format time (1/10000 of a second units)
+    // nanoseconds need to be converted to these units: ns / 100000
+    let n = (hour * 3600 + minute * 60 + second) * 10000 + nanosecond / 100000;
     bint32_to_bytes(n as i32)
 }
 

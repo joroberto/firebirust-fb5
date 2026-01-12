@@ -53,6 +53,12 @@ impl From<&str> for Param {
     }
 }
 
+impl From<String> for Param {
+    fn from(v: String) -> Param {
+        Param::Text(v)
+    }
+}
+
 impl From<i16> for Param {
     fn from(v: i16) -> Param {
         Param::Short(v)
@@ -153,7 +159,7 @@ impl ToSqlParam for Param {
             }
             Param::Short(n) => {
                 value.write(&utils::bint32_to_bytes(*n as i32)).unwrap();
-                blr.write(&[8, 0]).unwrap();
+                blr.write(&[7, 0]).unwrap();  // BLR 7 = blr_short (SMALLINT)
             }
             Param::Long(n) => {
                 value.write(&utils::bint32_to_bytes(*n)).unwrap();
@@ -254,6 +260,7 @@ to_sql_param!(i64);
 to_sql_param!(i128);
 to_sql_param!(chrono::NaiveTime);
 to_sql_param!(chrono::NaiveDate);
+to_sql_param!(chrono::NaiveDateTime);
 to_sql_param!(f32);
 to_sql_param!(f64);
 to_sql_param!(&[u8]);
