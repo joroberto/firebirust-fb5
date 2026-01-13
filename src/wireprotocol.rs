@@ -285,6 +285,14 @@ impl WireProtocol {
         self.accept_architecture = utils::bytes_to_buint32(&self.recv_packets(4)?) as i32;
         self.accept_type = utils::bytes_to_buint32(&self.recv_packets(4)?);
 
+        // Enable compression IMMEDIATELY after accept if negotiated
+        // Compression must be enabled BEFORE encryption (compression wraps the encrypted stream)
+        let want_compress = options.get("compress").map_or(false, |v| v == "true" || v == "1");
+        if want_compress && (self.accept_type & PFLAG_COMPRESS) != 0 {
+            debug_print!("Wire compression enabled (before crypt)");
+            self.channel.enable_compression();
+        }
+
         assert!(opcode == OP_COND_ACCEPT || opcode == OP_ACCEPT_DATA);
 
         let mut ln: usize = utils::bytes_to_buint32(&self.recv_packets(4)?) as usize;
@@ -351,14 +359,6 @@ impl WireProtocol {
             self.op_response()?;
         } else {
             self.auth_data = Some(auth_data); // use in op_attach(), op_create()
-        }
-
-        // Enable compression if negotiated
-        // Compression must be enabled AFTER encryption setup (encryption wraps compressed data)
-        let want_compress = options.get("compress").map_or(false, |v| v == "true" || v == "1");
-        if want_compress && (self.accept_type & PFLAG_COMPRESS) != 0 {
-            debug_print!("Wire compression enabled");
-            self.channel.enable_compression();
         }
 
         Ok(())
