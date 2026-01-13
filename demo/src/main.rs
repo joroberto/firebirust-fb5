@@ -155,15 +155,11 @@ fn demo_02_basic_connection(conn_url: &str, results: &mut TestResults) {
 fn demo_03_connection_options(conn_url: &str, results: &mut TestResults) {
     println!("\n[3/12] Connection with Options");
 
-    // Test wire compression (conn_url already has auth_plugin_name, so use &)
-    // Note: Wire compression requires server support and proper configuration
+    // Test wire compression (with wire_crypt enabled by default)
     let compress_url = format!("{}&compress=true", conn_url);
     match Connection::connect(&compress_url) {
         Ok(_) => results.pass("Wire compression"),
-        Err(_) => {
-            println!("  Wire compression ... SKIPPED (server may not support it)");
-            // Don't count as failure - it's optional
-        }
+        Err(e) => results.fail("Wire compression", &format!("{:?}", e)),
     }
 
     // Auth plugin is already tested via the base URL (Srp256 is default)
