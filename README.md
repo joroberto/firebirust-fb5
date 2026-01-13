@@ -115,6 +115,58 @@ for user in users {
 }
 ```
 
+## Transaction Behavior
+
+### Autocommit Mode (Default)
+
+By default, each INSERT/UPDATE/DELETE statement is automatically committed:
+
+```rust
+let mut conn = Connection::connect("firebird://...").unwrap();
+
+// Each statement commits automatically
+conn.execute("INSERT INTO users (id, name) VALUES (?, ?)", (1, "John")).unwrap();
+conn.execute("UPDATE users SET name = ? WHERE id = ?", ("Jane", 1)).unwrap();
+// No explicit commit needed - already committed
+```
+
+### Explicit Transaction
+
+For multiple operations that should be atomic:
+
+```rust
+let mut conn = Connection::connect("firebird://...").unwrap();
+
+let mut trans = conn.transaction().unwrap();
+
+trans.execute("INSERT INTO users VALUES (?, ?)", (1, "John")).unwrap();
+trans.execute("INSERT INTO users VALUES (?, ?)", (2, "Jane")).unwrap();
+
+// Must explicitly commit or rollback
+trans.commit().unwrap();
+// or: trans.rollback().unwrap();
+```
+
+### Batch Insert (No Autocommit)
+
+For bulk inserts, use `prepare_no_autocommit()` to avoid commit overhead on each row:
+
+```rust
+let mut conn = Connection::connect("firebird://...").unwrap();
+
+// Prepare without autocommit for better performance
+let mut stmt = conn.prepare_no_autocommit("INSERT INTO logs (id, msg) VALUES (?, ?)").unwrap();
+
+for i in 0..10000 {
+    stmt.execute((i, format!("Message {}", i))).unwrap();
+}
+
+// Single commit at the end
+conn.commit().unwrap();
+```
+
+This reduces insert time significantly (e.g., from ~9000ms to ~6850ms for 10000 rows).
+
 ## Transaction Isolation Levels
 
 ```rust
