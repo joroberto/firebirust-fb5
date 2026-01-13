@@ -1,0 +1,10 @@
+# Environment file with credentials
+.env
+
+# Firebird database files
+*.fdb
+*.fdb-journal
+
+# Rust build artifacts
+target/
+Cargo.lock
