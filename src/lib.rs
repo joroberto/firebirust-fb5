@@ -56,6 +56,7 @@ pub use crate::error::{Error, ValueError};
 pub use crate::param::Param;
 pub use crate::param::ToSqlParam;
 pub use crate::pool::{ConnectionPool, PoolOptions, PoolGuard};
+pub use crate::statement::ColumnInfo;
 pub use crate::transaction::{IsolationLevel, LockWait, TransactionOptions};
 
 // Column type

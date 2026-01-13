@@ -250,6 +250,53 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Column Metadata (Statement Description)
+
+Get detailed metadata about query result columns:
+
+```rust
+use firebirust::{Connection, ColumnInfo};
+
+let mut conn = Connection::connect("firebird://...").unwrap();
+let mut stmt = conn.prepare("SELECT id, name, salary FROM employees").unwrap();
+
+// Get column metadata (DB-API 2.0 style description)
+let columns: Vec<ColumnInfo> = stmt.description();
+
+for col in &columns {
+    println!("Column: {}", col.name);
+    println!("  Type: {} (code: {})", col.type_name(), col.type_code);
+    println!("  Nullable: {}", col.nullable);
+    println!("  Table: {}", col.table_name);
+    if let Some(precision) = col.precision {
+        println!("  Precision: {}, Scale: {}", precision, col.scale);
+    }
+}
+
+// Execute query and get row count
+let rows = stmt.query(()).unwrap();
+println!("Rows affected/fetched: {}", stmt.rowcount());
+
+// Simple column info
+println!("Column count: {}", stmt.column_count());
+println!("Column names: {:?}", stmt.column_names());
+```
+
+### ColumnInfo Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | String | Column alias or field name |
+| `type_code` | u32 | SQL type code |
+| `display_size` | Option\<i32\> | Display size (character types) |
+| `internal_size` | i32 | Storage size in bytes |
+| `precision` | Option\<i32\> | Numeric precision |
+| `scale` | i32 | Numeric scale |
+| `nullable` | bool | Whether NULL is allowed |
+| `field_name` | String | Original field name |
+| `table_name` | String | Table name |
+| `owner_name` | String | Owner name |
+
 ## Supported Data Types
 
 | Firebird Type | Rust Type |

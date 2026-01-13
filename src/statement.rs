@@ -35,6 +35,58 @@ use std::collections::VecDeque;
 const DSQL_CLOSE: i32 = 1;
 const DSQL_DROP: i32 = 2;
 
+/// Column metadata information (DB-API 2.0 style description)
+#[derive(Debug, Clone)]
+pub struct ColumnInfo {
+    /// Column name (alias if available, otherwise field name)
+    pub name: String,
+    /// SQL type code
+    pub type_code: u32,
+    /// Display size (for character types)
+    pub display_size: Option<i32>,
+    /// Internal storage size in bytes
+    pub internal_size: i32,
+    /// Numeric precision (for DECIMAL/NUMERIC types)
+    pub precision: Option<i32>,
+    /// Numeric scale (for DECIMAL/NUMERIC types)
+    pub scale: i32,
+    /// Whether NULL values are allowed
+    pub nullable: bool,
+    /// Original field name in the table
+    pub field_name: String,
+    /// Table name (relation name)
+    pub table_name: String,
+    /// Owner name
+    pub owner_name: String,
+}
+
+impl ColumnInfo {
+    /// Get a human-readable type name
+    pub fn type_name(&self) -> &'static str {
+        match self.type_code {
+            super::SQL_TYPE_TEXT => "CHAR",
+            super::SQL_TYPE_VARYING => "VARCHAR",
+            super::SQL_TYPE_SHORT => "SMALLINT",
+            super::SQL_TYPE_LONG => "INTEGER",
+            super::SQL_TYPE_INT64 => "BIGINT",
+            super::SQL_TYPE_INT128 => "INT128",
+            super::SQL_TYPE_FLOAT => "FLOAT",
+            super::SQL_TYPE_DOUBLE => "DOUBLE PRECISION",
+            super::SQL_TYPE_DATE => "DATE",
+            super::SQL_TYPE_TIME => "TIME",
+            super::SQL_TYPE_TIMESTAMP => "TIMESTAMP",
+            super::SQL_TYPE_TIME_TZ => "TIME WITH TIME ZONE",
+            super::SQL_TYPE_TIMESTAMP_TZ => "TIMESTAMP WITH TIME ZONE",
+            super::SQL_TYPE_BLOB => "BLOB",
+            super::SQL_TYPE_BOOLEAN => "BOOLEAN",
+            super::SQL_TYPE_DEC64 => "DECFLOAT(16)",
+            super::SQL_TYPE_DEC128 => "DECFLOAT(34)",
+            super::SQL_TYPE_DEC_FIXED => "NUMERIC",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
 pub struct Statement<'conn> {
     conn: &'conn Connection,
     pub(crate) trans_handle: i32,
@@ -43,6 +95,7 @@ pub struct Statement<'conn> {
     pub(crate) xsqlda: Vec<XSQLVar>,
     autocommit: bool,
     params: Vec<(Vec<u8>, Vec<u8>, bool)>,
+    last_rowcount: usize,
 }
 
 impl Statement<'_> {
@@ -62,6 +115,7 @@ impl Statement<'_> {
             xsqlda,
             autocommit,
             params: Vec::new(),
+            last_rowcount: 0,
         }
     }
 
@@ -118,7 +172,7 @@ impl Statement<'_> {
 
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows, Error> {
         params.__bind_in(self)?;
-        self.conn._execute_statement(
+        self.last_rowcount = self.conn._execute_statement(
             self.trans_handle,
             self.stmt_handle,
             self.stmt_type,
@@ -155,6 +209,57 @@ impl Statement<'_> {
 
     pub fn column_names(&self) -> Vec<&str> {
         self.xsqlda.iter().map(|x| x.aliasname.as_str()).collect()
+    }
+
+    /// Get the number of rows affected by the last execute/query operation.
+    /// For SELECT statements, returns the number of rows fetched.
+    /// For INSERT/UPDATE/DELETE, returns the number of affected rows.
+    pub fn rowcount(&self) -> usize {
+        self.last_rowcount
+    }
+
+    /// Get column metadata for all columns (DB-API 2.0 style description).
+    /// Returns a vector of ColumnInfo structs with detailed metadata for each column.
+    pub fn description(&self) -> Vec<ColumnInfo> {
+        self.xsqlda
+            .iter()
+            .map(|x| {
+                // Calculate display size for character types
+                let display_size = match x.sqltype {
+                    super::SQL_TYPE_TEXT | super::SQL_TYPE_VARYING => Some(x.sqllen),
+                    _ => None,
+                };
+
+                // Calculate precision for numeric types
+                let precision = match x.sqltype {
+                    super::SQL_TYPE_SHORT => Some(5),
+                    super::SQL_TYPE_LONG => Some(10),
+                    super::SQL_TYPE_INT64 => Some(19),
+                    super::SQL_TYPE_INT128 => Some(38),
+                    super::SQL_TYPE_DEC64 => Some(16),
+                    super::SQL_TYPE_DEC128 => Some(34),
+                    super::SQL_TYPE_DEC_FIXED => Some(x.sqllen),
+                    _ => None,
+                };
+
+                ColumnInfo {
+                    name: if x.aliasname.is_empty() {
+                        x.fieldname.clone()
+                    } else {
+                        x.aliasname.clone()
+                    },
+                    type_code: x.sqltype,
+                    display_size,
+                    internal_size: x.sqllen,
+                    precision,
+                    scale: x.sqlscale,
+                    nullable: x.null_ok,
+                    field_name: x.fieldname.clone(),
+                    table_name: x.relname.clone(),
+                    owner_name: x.ownname.clone(),
+                }
+            })
+            .collect()
     }
 
     pub fn column_metadata(
