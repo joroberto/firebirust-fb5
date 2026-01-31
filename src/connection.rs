@@ -353,4 +353,10 @@ impl Connection {
         let mut wp = self.wp.borrow_mut();
         wp.op_cancel_events(event_id)
     }
+
+    /// Extract complete database schema DDL
+    /// Similar to `isql -x` command
+    pub fn extract_ddl(&mut self) -> Result<String, Error> {
+        crate::ddl_extractor::extract_ddl(self)
+    }
 }

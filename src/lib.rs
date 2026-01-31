@@ -27,6 +27,7 @@ mod compression;
 mod conn_params;
 mod connection;
 mod crypt_translater;
+mod ddl_extractor;
 mod decfloat;
 mod errmsgs;
 mod error;
