@@ -24,9 +24,8 @@ use super::crypt_translater::{Arc4, ChaCha, CryptTranslator};
 use super::error::Error;
 use async_std::io::prelude::*;
 use async_std::net::TcpStream;
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
-use hex;
+use digest::Digest;
+use sha2::Sha256;
 
 pub struct WireChannelAsync {
     stream: TcpStream,
@@ -49,8 +48,8 @@ impl WireChannelAsync {
     pub fn set_crypt_key(&mut self, plugin: &[u8], key: &[u8], nonce: &[u8]) {
         if plugin == b"ChaCha64" || plugin == b"ChaCha" {
             let mut hasher = Sha256::new();
-            hasher.input(&key);
-            let key = &hex::decode(hasher.result_str()).unwrap();
+            hasher.update(&key);
+            let key = &hasher.finalize().to_vec();
             self.read_trans = Some(Box::new(ChaCha::new(key, nonce)));
             self.write_trans = Some(Box::new(ChaCha::new(key, nonce)));
         } else if plugin == b"Arc4" {

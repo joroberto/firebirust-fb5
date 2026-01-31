@@ -26,9 +26,9 @@
 
 use std::io::prelude::*;
 
-use crypto::digest::Digest;
-use crypto::sha1::Sha1;
-use crypto::sha2::Sha256;
+use digest::Digest;
+use sha1::Sha1;
+use sha2::Sha256;
 use num_bigint::BigInt;
 use rand::prelude::*;
 
@@ -62,26 +62,27 @@ pub fn get_scramble(key_public_a: &BigInt, key_public_b: &BigInt) -> BigInt {
     // key_a:A client public ephemeral values
     // key_b:B server public ephemeral values
     let mut hasher = Sha1::new();
-    hasher.input(&pad(key_public_a));
-    hasher.input(&pad(key_public_b));
-    utils::big_int_from_hex_string(&hasher.result_str().as_bytes())
+    hasher.update(&pad(key_public_a));
+    hasher.update(&pad(key_public_b));
+    utils::big_int_from_hex_string(hex::encode(hasher.finalize()).as_bytes())
 }
 
 pub fn get_string_hash(s: &str) -> BigInt {
     let mut hasher = Sha1::new();
-    hasher.input(s.as_bytes());
-    utils::big_int_from_hex_string(&hasher.result_str().as_bytes())
+    hasher.update(s.as_bytes());
+    utils::big_int_from_hex_string(hex::encode(hasher.finalize()).as_bytes())
 }
 
 pub fn get_user_hash(salt: &[u8], user: &str, password: &str) -> BigInt {
     let mut hash1 = Sha1::new();
-    hash1.input(user.as_bytes());
-    hash1.input(b":");
-    hash1.input(password.as_bytes());
+    hash1.update(user.as_bytes());
+    hash1.update(b":");
+    hash1.update(password.as_bytes());
+    let hash1_result = hash1.finalize();
     let mut hash2 = Sha1::new();
-    hash2.input(salt);
-    hash2.input(&hex::decode(hash1.result_str()).unwrap());
-    utils::bytes_to_big_int(&hex::decode(hash2.result_str()).unwrap())
+    hash2.update(salt);
+    hash2.update(&hash1_result);
+    utils::bytes_to_big_int(&hash2.finalize())
 }
 
 pub fn get_client_seed() -> (BigInt, BigInt) {
@@ -200,22 +201,22 @@ pub fn get_client_proof(
     // Srp
     if plugin_name == "Srp" {
         let mut hasher = Sha1::new();
-        hasher.input(&utils::big_int_to_bytes(&n3));
-        hasher.input(&utils::big_int_to_bytes(&n4));
-        hasher.input(salt);
-        hasher.input(&utils::big_int_to_bytes(&key_public_a));
-        hasher.input(&utils::big_int_to_bytes(&key_public_b));
-        hasher.input(&key_k);
-        key_m = hex::decode(&hasher.result_str()).unwrap();
+        hasher.update(&utils::big_int_to_bytes(&n3));
+        hasher.update(&utils::big_int_to_bytes(&n4));
+        hasher.update(salt);
+        hasher.update(&utils::big_int_to_bytes(&key_public_a));
+        hasher.update(&utils::big_int_to_bytes(&key_public_b));
+        hasher.update(&key_k);
+        key_m = hasher.finalize().to_vec();
     } else if plugin_name == "Srp256" {
         let mut hasher = Sha256::new();
-        hasher.input(&utils::big_int_to_bytes(&n3));
-        hasher.input(&utils::big_int_to_bytes(&n4));
-        hasher.input(salt);
-        hasher.input(&utils::big_int_to_bytes(&key_public_a));
-        hasher.input(&utils::big_int_to_bytes(&key_public_b));
-        hasher.input(&key_k);
-        key_m = hex::decode(&hasher.result_str()).unwrap();
+        hasher.update(&utils::big_int_to_bytes(&n3));
+        hasher.update(&utils::big_int_to_bytes(&n4));
+        hasher.update(salt);
+        hasher.update(&utils::big_int_to_bytes(&key_public_a));
+        hasher.update(&utils::big_int_to_bytes(&key_public_b));
+        hasher.update(&key_k);
+        key_m = hasher.finalize().to_vec();
     } else {
         panic!("srp protocol error");
     }

@@ -28,8 +28,8 @@ use std::str;
 use chrono;
 use chrono::TimeZone;
 use chrono_tz;
-use crypto::digest::Digest;
-use crypto::sha1::Sha1;
+use digest::Digest;
+use sha1::Sha1;
 use hex;
 use num_bigint::{BigInt, BigUint, Sign};
 
@@ -305,8 +305,8 @@ pub fn bytes_to_big_int(b: &[u8]) -> BigInt {
 
 pub fn big_int_to_sha1_hex(i: &BigInt) -> String {
     let mut hasher = Sha1::new();
-    hasher.input(&big_int_to_bytes(i));
-    hasher.result_str()
+    hasher.update(&big_int_to_bytes(i));
+    hex::encode(hasher.finalize())
 }
 
 pub fn big_int_to_sha1(i: &BigInt) -> Vec<u8> {
