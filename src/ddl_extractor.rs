@@ -444,50 +444,53 @@ fn list_functions_ods12_headers(_conn: &mut Connection, _output: &mut String) ->
 // 10. PROCEDURE HEADERS
 // ============================================================================
 fn list_procedure_headers(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
+    // Get procedures with their source code to output CREATE OR ALTER PROCEDURE like ISQL
     let sql = r#"
-        SELECT p.RDB$PROCEDURE_NAME, p.RDB$OWNER_NAME
+        SELECT p.RDB$PROCEDURE_NAME, p.RDB$OWNER_NAME, p.RDB$PROCEDURE_SOURCE
         FROM RDB$PROCEDURES p
         WHERE (p.RDB$SYSTEM_FLAG IS NULL OR p.RDB$SYSTEM_FLAG <> 1)
           AND p.RDB$PACKAGE_NAME IS NULL
         ORDER BY p.RDB$PROCEDURE_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut procs = Vec::new();
     for row in rows {
         procs.push((
             row.get::<String>(0).unwrap_or_default().trim().to_string(),
             row.get::<String>(1).unwrap_or_default().trim().to_string(),
+            row.get::<Option<String>>(2).ok().flatten(),
         ));
     }
     drop(stmt);
-    
+
     if !procs.is_empty() {
         output.push_str("\nSET TERM ^ ;\n\n");
-        
-        for (proc_name, owner) in procs {
+
+        for (proc_name, owner, source) in procs {
             output.push_str(&format!("/* Stored procedure: {}, Owner: {} */\n", proc_name, owner));
-            
+
             // Get parameters
             let param_sql = r#"
                 SELECT p.RDB$PARAMETER_NAME, p.RDB$PARAMETER_TYPE, f.RDB$FIELD_TYPE,
                        f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION,
-                       f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH, p.RDB$NULL_FLAG
+                       f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH, p.RDB$NULL_FLAG,
+                       p.RDB$FIELD_SOURCE, f.RDB$CHARACTER_SET_ID
                 FROM RDB$PROCEDURE_PARAMETERS p
                 JOIN RDB$FIELDS f ON p.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
                 WHERE p.RDB$PROCEDURE_NAME = ?
                   AND p.RDB$PACKAGE_NAME IS NULL
                 ORDER BY p.RDB$PARAMETER_TYPE, p.RDB$PARAMETER_NUMBER
             "#;
-            
+
             let mut stmt = conn.prepare(param_sql)?;
             let params = stmt.query((proc_name.as_str(),))?;
-            
+
             let mut inputs = Vec::new();
             let mut outputs = Vec::new();
-            
+
             for p in params {
                 let pname = p.get::<String>(0).unwrap_or_default().trim().to_string();
                 let ptype = p.get::<i16>(1).unwrap_or(0);
@@ -498,32 +501,51 @@ fn list_procedure_headers(conn: &mut Connection, output: &mut String) -> Result<
                 let scale = p.get::<i16>(6).unwrap_or(0);
                 let clen = p.get::<i16>(7).unwrap_or(0);
                 let _nullf = p.get::<Option<i16>>(8).ok().flatten();
-                
-                let type_str = format_data_type(ft, st, len, prec, scale, clen, None, None);
-                
+                let csid = p.get::<Option<i16>>(10).ok().flatten();
+
+                let mut type_str = format_data_type(ft, st, len, prec, scale, clen, None, None);
+
+                // Add character set for string types if not default
+                if let Some(cs) = csid {
+                    if cs > 0 && (ft == 14 || ft == 37) {
+                        let csname = get_charset_name(cs);
+                        if !csname.is_empty() && csname != "NONE" {
+                            type_str.push_str(&format!(" CHARACTER SET {}", csname));
+                        }
+                    }
+                }
+
                 if ptype == 0 {
-                    inputs.push(format!("{} {}", quote_identifier(&pname), type_str));
+                    inputs.push(format!("{} {}", pname, type_str));
                 } else {
-                    outputs.push(format!("{} {}", quote_identifier(&pname), type_str));
+                    outputs.push(format!("{} {}", pname, type_str));
                 }
             }
             drop(stmt);
-            
-            output.push_str(&format!("CREATE PROCEDURE {} ", quote_identifier(&proc_name)));
+
+            // Output CREATE OR ALTER PROCEDURE like ISQL
+            output.push_str(&format!("CREATE OR ALTER PROCEDURE {} ", quote_identifier(&proc_name)));
             if !inputs.is_empty() {
-                output.push_str(&format!("({})\n", inputs.join(", ")));
+                output.push_str(&format!("({})\n", inputs.join(",\n")));
             } else {
                 output.push_str("\n");
             }
-            
+
             if !outputs.is_empty() {
                 output.push_str(&format!("RETURNS ({})\n", outputs.join(", ")));
             }
-            
-            output.push_str("AS\nBEGIN\n  /* Procedure body */\nEND^\n\n");
+
+            // Include the actual source code
+            if let Some(ref src) = source {
+                output.push_str(&format!("AS\n{}^\n\n", src.trim()));
+            } else {
+                output.push_str("AS\nBEGIN\n  SUSPEND;\nEND^\n\n");
+            }
         }
+
+        output.push_str("SET TERM ; ^\n\n");
     }
-    
+
     Ok(())
 }
 
@@ -759,36 +781,67 @@ struct FkInfo {
 // 14. VIEWS
 // ============================================================================
 fn list_views(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    let sql = r#"
+    // First, collect all views info
+    let sql_views = r#"
         SELECT r.RDB$RELATION_NAME, r.RDB$OWNER_NAME, r.RDB$VIEW_SOURCE
         FROM RDB$RELATIONS r
         WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
           AND r.RDB$VIEW_BLR IS NOT NULL
-        ORDER BY r.RDB$RELATION_NAME
+        ORDER BY r.RDB$RELATION_ID
     "#;
-    
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query(())?;
-    
-    let mut first = true;
-    for row in rows {
-        if first {
-            output.push_str("\n/*  Views */\n\n");
-            first = false;
-        }
-        
-        let name = row.get::<String>(0).unwrap_or_default().trim().to_string();
-        let owner = row.get::<String>(1).unwrap_or_default().trim().to_string();
-        let source = row.get::<Option<String>>(2).ok().flatten();
-        
-        output.push_str(&format!("/* View: {}, Owner: {} */\n", name, owner));
-        
-        if let Some(src) = source {
-            output.push_str(&format!("{}\n\n", src));
+
+    let mut views: Vec<(String, String, Option<String>)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(sql_views)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let name = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let owner = row.get::<String>(1).unwrap_or_default().trim().to_string();
+            let source = row.get::<Option<String>>(2).ok().flatten();
+            views.push((name, owner, source));
         }
     }
-    drop(stmt);
-    
+
+    if views.is_empty() {
+        return Ok(());
+    }
+
+    output.push_str("\n/*  Views */\n\n");
+
+    // For each view, get columns and generate CREATE VIEW
+    for (name, owner, source) in views {
+        // Get view columns
+        let sql_cols = format!(r#"
+            SELECT RDB$FIELD_NAME
+            FROM RDB$RELATION_FIELDS
+            WHERE RDB$RELATION_NAME = '{}'
+            ORDER BY RDB$FIELD_POSITION
+        "#, name);
+
+        let mut columns: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare(&sql_cols)?;
+            let rows = stmt.query(())?;
+            for row in rows {
+                let col = row.get::<String>(0).unwrap_or_default().trim().to_string();
+                columns.push(col);
+            }
+        }
+
+        // Generate CREATE VIEW statement
+        output.push_str(&format!("/* View: {}, Owner: {} */\n", name, owner));
+        output.push_str(&format!("CREATE VIEW {} (", quote_identifier(&name)));
+        output.push_str(&columns.join(", "));
+        output.push_str(") AS\n");
+
+        if let Some(src) = source {
+            // Trim leading/trailing whitespace but preserve internal formatting
+            let src = src.trim();
+            output.push_str(src);
+        }
+        output.push_str(";\n\n");
+    }
+
     Ok(())
 }
 
@@ -834,36 +887,8 @@ fn list_functions_ods12_bodies(_conn: &mut Connection, _output: &mut String) -> 
     Ok(())
 }
 
-fn list_procedure_bodies(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    let sql = r#"
-        SELECT p.RDB$PROCEDURE_NAME, p.RDB$PROCEDURE_SOURCE
-        FROM RDB$PROCEDURES p
-        WHERE (p.RDB$SYSTEM_FLAG IS NULL OR p.RDB$SYSTEM_FLAG <> 1)
-          AND p.RDB$PACKAGE_NAME IS NULL
-          AND p.RDB$PROCEDURE_SOURCE IS NOT NULL
-        ORDER BY p.RDB$PROCEDURE_NAME
-    "#;
-    
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query(())?;
-    
-    let mut first = true;
-    for row in rows {
-        if first {
-            output.push_str("\n/*  Procedure bodies */\n\n");
-            first = false;
-        }
-        
-        let name = row.get::<String>(0).unwrap_or_default().trim().to_string();
-        let source = row.get::<Option<String>>(1).ok().flatten();
-        
-        if let Some(src) = source {
-            output.push_str(&format!("ALTER PROCEDURE {}\n{}^\n\n",
-                quote_identifier(&name), src));
-        }
-    }
-    drop(stmt);
-    
+fn list_procedure_bodies(_conn: &mut Connection, _output: &mut String) -> Result<(), Error> {
+    // Procedure bodies are now included in list_procedure_headers using CREATE OR ALTER PROCEDURE
     Ok(())
 }
 
@@ -912,31 +937,43 @@ fn list_domain_constraints(_conn: &mut Connection, _output: &mut String) -> Resu
 // ============================================================================
 fn list_check(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
     // Table-level check constraints
+    // Use DISTINCT to avoid duplicates from multiple triggers per constraint
     let sql = r#"
-        SELECT rc.RDB$CONSTRAINT_NAME, rc.RDB$RELATION_NAME, t.RDB$TRIGGER_SOURCE
+        SELECT DISTINCT rc.RDB$CONSTRAINT_NAME, rc.RDB$RELATION_NAME, t.RDB$TRIGGER_SOURCE
         FROM RDB$RELATION_CONSTRAINTS rc
         JOIN RDB$CHECK_CONSTRAINTS cc ON rc.RDB$CONSTRAINT_NAME = cc.RDB$CONSTRAINT_NAME
         JOIN RDB$TRIGGERS t ON cc.RDB$TRIGGER_NAME = t.RDB$TRIGGER_NAME
         WHERE rc.RDB$CONSTRAINT_TYPE = 'CHECK'
         ORDER BY rc.RDB$RELATION_NAME, rc.RDB$CONSTRAINT_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut first = true;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for row in rows {
+        let cons = row.get::<String>(0).unwrap_or_default().trim().to_string();
+        let table = row.get::<String>(1).unwrap_or_default().trim().to_string();
+        let source = row.get::<Option<String>>(2).ok().flatten();
+
+        // Skip if we've already seen this constraint
+        let key = format!("{}.{}", table, cons);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+
         if first {
             output.push_str("\n/*  Check constraints */\n");
             first = false;
         }
-        
-        let cons = row.get::<String>(0).unwrap_or_default().trim().to_string();
-        let table = row.get::<String>(1).unwrap_or_default().trim().to_string();
-        let source = row.get::<Option<String>>(2).ok().flatten();
-        
+
         if let Some(src) = source {
-            output.push_str(&format!("\nALTER TABLE {} ADD CONSTRAINT {} CHECK ({});\n",
+            // The trigger source already contains "CHECK (condition)"
+            // So we need to output it directly, not wrap in another CHECK()
+            output.push_str(&format!("\nALTER TABLE {} ADD CONSTRAINT {} {};\n",
                 quote_identifier(&table),
                 quote_identifier(&cons),
                 src.trim()
@@ -944,7 +981,7 @@ fn list_check(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
         }
     }
     drop(stmt);
-    
+
     Ok(())
 }
 
@@ -1068,70 +1105,258 @@ fn list_all_grants(conn: &mut Connection, output: &mut String) -> Result<(), Err
         WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
         ORDER BY r.RDB$ROLE_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(role_sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut first = true;
     for row in rows {
         if first {
             output.push_str("\n/* Grant roles for this database */\n\n");
             first = false;
         }
-        
+
         let name = row.get::<String>(0).unwrap_or_default().trim().to_string();
         let owner = row.get::<String>(1).unwrap_or_default().trim().to_string();
-        
+
         output.push_str(&format!("/* Role: {}, Owner: {} */\n", name, owner));
         output.push_str(&format!("CREATE ROLE {};\n", quote_identifier(&name)));
     }
     drop(stmt);
-    
-    // Permissions on tables
+
+    // Permissions on relations (tables/views)
+    // Based on ISQL extract.epp / show.epp logic:
+    // 1. Filter out where grantor is NULL (implicit/default grants)
+    // 2. Filter out where user is the owner (owner's own grants)
+    // 3. Only include grants for non-system relations with SQL$ security class
     let sql = r#"
         SELECT p.RDB$USER, p.RDB$GRANTOR, p.RDB$PRIVILEGE, p.RDB$GRANT_OPTION,
-               p.RDB$RELATION_NAME, p.RDB$USER_TYPE, p.RDB$OBJECT_TYPE
+               p.RDB$RELATION_NAME, p.RDB$USER_TYPE, p.RDB$OBJECT_TYPE, p.RDB$FIELD_NAME
         FROM RDB$USER_PRIVILEGES p
+        JOIN RDB$RELATIONS r ON p.RDB$RELATION_NAME = r.RDB$RELATION_NAME
         WHERE p.RDB$OBJECT_TYPE = 0
-        ORDER BY p.RDB$RELATION_NAME, p.RDB$USER
+          AND p.RDB$GRANTOR IS NOT NULL
+          AND r.RDB$OWNER_NAME <> p.RDB$USER
+          AND (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
+          AND r.RDB$SECURITY_CLASS STARTING WITH 'SQL$'
+        ORDER BY p.RDB$RELATION_NAME, p.RDB$USER, p.RDB$PRIVILEGE
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
-    let mut first = true;
+
+    // Collect all grants, then group by relation/user to combine privileges
+    let mut grants: Vec<GrantInfo> = Vec::new();
     for row in rows {
-        if first {
-            output.push_str("\n/* Grant permissions for this database */\n\n");
-            first = false;
+        grants.push(GrantInfo {
+            user: row.get::<String>(0).unwrap_or_default().trim().to_string(),
+            grantor: row.get::<String>(1).unwrap_or_default().trim().to_string(),
+            privilege: row.get::<String>(2).unwrap_or_default().trim().to_string(),
+            grant_option: row.get::<Option<i16>>(3).ok().flatten(),
+            relation: row.get::<String>(4).unwrap_or_default().trim().to_string(),
+            user_type: row.get::<Option<i16>>(5).ok().flatten(),
+            field_name: row.get::<Option<String>>(7).ok().flatten().map(|s| s.trim().to_string()),
+        });
+    }
+    drop(stmt);
+
+    if grants.is_empty() {
+        return Ok(());
+    }
+
+    output.push_str("\n/* Grant permissions for this database */\n\n");
+
+    // Group grants by relation and user, combine privileges on same line
+    // ISQL outputs: GRANT SELECT, UPDATE ON TABLE TO USER;
+    let mut current_relation = String::new();
+    let mut current_user = String::new();
+    let mut current_grant_option: Option<i16> = None;
+    let mut current_privs: Vec<String> = Vec::new();
+    let mut current_user_type: Option<i16> = None;
+
+    for grant in &grants {
+        // Check if we need to flush previous grants
+        if grant.relation != current_relation || grant.user != current_user || grant.grant_option != current_grant_option {
+            // Flush previous group
+            if !current_privs.is_empty() {
+                output_grant(output, &current_relation, &current_user, current_user_type, &current_privs, current_grant_option);
+            }
+
+            current_relation = grant.relation.clone();
+            current_user = grant.user.clone();
+            current_grant_option = grant.grant_option;
+            current_user_type = grant.user_type;
+            current_privs.clear();
         }
-        
-        let user = row.get::<String>(0).unwrap_or_default().trim().to_string();
-        let privilege = row.get::<String>(2).unwrap_or_default();
-        let grant_option = row.get::<Option<i16>>(3).ok().flatten();
-        let relation = row.get::<String>(4).unwrap_or_default().trim().to_string();
-        
-        let priv_str = match privilege.as_str() {
-            "S" => "SELECT",
-            "I" => "INSERT",
-            "U" => "UPDATE",
-            "D" => "DELETE",
-            "R" => "REFERENCES",
-            "X" => "EXECUTE",
-            "M" => "MEMBER OF",
-            _ => &privilege,
+
+        let priv_str = match grant.privilege.as_str() {
+            "S" => "SELECT".to_string(),
+            "I" => "INSERT".to_string(),
+            "U" => {
+                if let Some(ref field) = grant.field_name {
+                    format!("UPDATE({})", quote_identifier(field))
+                } else {
+                    "UPDATE".to_string()
+                }
+            }
+            "D" => "DELETE".to_string(),
+            "R" => {
+                if let Some(ref field) = grant.field_name {
+                    format!("REFERENCES({})", quote_identifier(field))
+                } else {
+                    "REFERENCES".to_string()
+                }
+            }
+            _ => grant.privilege.clone(),
         };
-        
-        output.push_str(&format!("GRANT {} ON {} TO {}{};\n",
-            priv_str,
-            quote_identifier(&relation),
-            quote_identifier(&user),
+
+        if !current_privs.contains(&priv_str) {
+            current_privs.push(priv_str);
+        }
+    }
+
+    // Flush last group
+    if !current_privs.is_empty() {
+        output_grant(output, &current_relation, &current_user, current_user_type, &current_privs, current_grant_option);
+    }
+
+    // Grants on procedures
+    let proc_sql = r#"
+        SELECT p.RDB$USER, p.RDB$GRANTOR, p.RDB$PRIVILEGE, p.RDB$GRANT_OPTION,
+               p.RDB$RELATION_NAME, p.RDB$USER_TYPE
+        FROM RDB$USER_PRIVILEGES p
+        JOIN RDB$PROCEDURES pr ON p.RDB$RELATION_NAME = pr.RDB$PROCEDURE_NAME
+        WHERE p.RDB$OBJECT_TYPE = 5
+          AND p.RDB$PRIVILEGE = 'X'
+          AND p.RDB$GRANTOR IS NOT NULL
+          AND pr.RDB$OWNER_NAME <> p.RDB$USER
+          AND (pr.RDB$SYSTEM_FLAG IS NULL OR pr.RDB$SYSTEM_FLAG <> 1)
+          AND pr.RDB$PACKAGE_NAME IS NULL
+        ORDER BY p.RDB$RELATION_NAME, p.RDB$USER
+    "#;
+
+    let mut stmt = conn.prepare(proc_sql)?;
+    let rows = stmt.query(())?;
+
+    for row in rows {
+        let user = row.get::<String>(0).unwrap_or_default().trim().to_string();
+        let grant_option = row.get::<Option<i16>>(3).ok().flatten();
+        let proc = row.get::<String>(4).unwrap_or_default().trim().to_string();
+        let user_type = row.get::<Option<i16>>(5).ok().flatten();
+
+        let user_str = format_grant_user(&user, user_type);
+        output.push_str(&format!("GRANT EXECUTE ON PROCEDURE {} TO {}{};\n",
+            quote_identifier(&proc),
+            user_str,
             if grant_option == Some(1) { " WITH GRANT OPTION" } else { "" }
         ));
     }
     drop(stmt);
-    
+
+    // USAGE grants on generators (sequences)
+    // Object type 14 = generator
+    // Filter out self-grants (where user = grantor, typically SYSDBA to itself)
+    let gen_sql = r#"
+        SELECT p.RDB$USER, p.RDB$GRANTOR, p.RDB$PRIVILEGE, p.RDB$GRANT_OPTION,
+               p.RDB$RELATION_NAME, p.RDB$USER_TYPE
+        FROM RDB$USER_PRIVILEGES p
+        JOIN RDB$GENERATORS g ON p.RDB$RELATION_NAME = g.RDB$GENERATOR_NAME
+        WHERE p.RDB$OBJECT_TYPE = 14
+          AND p.RDB$PRIVILEGE = 'G'
+          AND p.RDB$GRANTOR IS NOT NULL
+          AND p.RDB$GRANTOR <> p.RDB$USER
+          AND (g.RDB$SYSTEM_FLAG IS NULL OR g.RDB$SYSTEM_FLAG <> 1)
+          AND g.RDB$GENERATOR_NAME NOT STARTING WITH 'RDB$'
+        ORDER BY p.RDB$RELATION_NAME, p.RDB$USER
+    "#;
+
+    let mut stmt = conn.prepare(gen_sql)?;
+    let rows = stmt.query(())?;
+
+    for row in rows {
+        let user = row.get::<String>(0).unwrap_or_default().trim().to_string();
+        let grant_option = row.get::<Option<i16>>(3).ok().flatten();
+        let gen_name = row.get::<String>(4).unwrap_or_default().trim().to_string();
+        let user_type = row.get::<Option<i16>>(5).ok().flatten();
+
+        let user_str = format_grant_user(&user, user_type);
+        output.push_str(&format!("GRANT USAGE ON SEQUENCE {} TO {}{};\n",
+            quote_identifier(&gen_name),
+            user_str,
+            if grant_option == Some(1) { " WITH GRANT OPTION" } else { "" }
+        ));
+    }
+    drop(stmt);
+
+    // USAGE grants on exceptions
+    // Object type 7 = exception
+    let exc_sql = r#"
+        SELECT p.RDB$USER, p.RDB$GRANTOR, p.RDB$PRIVILEGE, p.RDB$GRANT_OPTION,
+               p.RDB$RELATION_NAME, p.RDB$USER_TYPE
+        FROM RDB$USER_PRIVILEGES p
+        JOIN RDB$EXCEPTIONS e ON p.RDB$RELATION_NAME = e.RDB$EXCEPTION_NAME
+        WHERE p.RDB$OBJECT_TYPE = 7
+          AND p.RDB$PRIVILEGE = 'G'
+          AND p.RDB$GRANTOR IS NOT NULL
+          AND p.RDB$GRANTOR <> p.RDB$USER
+          AND (e.RDB$SYSTEM_FLAG IS NULL OR e.RDB$SYSTEM_FLAG <> 1)
+        ORDER BY p.RDB$RELATION_NAME, p.RDB$USER
+    "#;
+
+    let mut stmt = conn.prepare(exc_sql)?;
+    let rows = stmt.query(())?;
+
+    for row in rows {
+        let user = row.get::<String>(0).unwrap_or_default().trim().to_string();
+        let grant_option = row.get::<Option<i16>>(3).ok().flatten();
+        let exc_name = row.get::<String>(4).unwrap_or_default().trim().to_string();
+        let user_type = row.get::<Option<i16>>(5).ok().flatten();
+
+        let user_str = format_grant_user(&user, user_type);
+        output.push_str(&format!("GRANT USAGE ON EXCEPTION {} TO {}{};\n",
+            quote_identifier(&exc_name),
+            user_str,
+            if grant_option == Some(1) { " WITH GRANT OPTION" } else { "" }
+        ));
+    }
+    drop(stmt);
+
     Ok(())
+}
+
+struct GrantInfo {
+    user: String,
+    grantor: String,
+    privilege: String,
+    grant_option: Option<i16>,
+    relation: String,
+    user_type: Option<i16>,
+    field_name: Option<String>,
+}
+
+fn output_grant(output: &mut String, relation: &str, user: &str, user_type: Option<i16>, privs: &[String], grant_option: Option<i16>) {
+    let user_str = format_grant_user(user, user_type);
+    output.push_str(&format!("GRANT {} ON {} TO {}{};\n",
+        privs.join(", "),
+        quote_identifier(relation),
+        user_str,
+        if grant_option == Some(1) { " WITH GRANT OPTION" } else { "" }
+    ));
+}
+
+fn format_grant_user(user: &str, user_type: Option<i16>) -> String {
+    // User types in RDB$USER_PRIVILEGES.RDB$USER_TYPE:
+    // 0 = relation, 1 = view, 2 = trigger, 5 = procedure, 7 = exception
+    // 8 = user, 13 = role, 14 = generator, 15 = function, 18 = package
+    match user_type {
+        Some(2) => format!("TRIGGER {}", quote_identifier(user)),
+        Some(5) => format!("PROCEDURE {}", quote_identifier(user)),
+        Some(7) => format!("VIEW {}", quote_identifier(user)),
+        Some(13) => format!("ROLE {}", quote_identifier(user)),
+        Some(15) => format!("FUNCTION {}", quote_identifier(user)),
+        Some(18) => format!("PACKAGE {}", quote_identifier(user)),
+        _ => quote_identifier(user),
+    }
 }
 
 // ============================================================================
