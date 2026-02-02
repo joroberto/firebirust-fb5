@@ -155,12 +155,24 @@ impl Statement<'_> {
             for cell in row.iter_mut() {
                 match cell {
                     CellValue::BlobBinary(blob_id) => {
-                        let blob = self.conn._get_blob_segments(&blob_id, trans_handle);
-                        *cell = CellValue::BlobBinary(blob.unwrap());
+                        match self.conn._get_blob_segments(&blob_id, trans_handle) {
+                            Ok(blob) => *cell = CellValue::BlobBinary(blob),
+                            Err(e) => {
+                                // Log error instead of panic, return empty blob
+                                eprintln!("Warning: Failed to fetch binary blob: {:?}", e);
+                                *cell = CellValue::BlobBinary(vec![]);
+                            }
+                        }
                     }
                     CellValue::BlobText(blob_id) => {
-                        let blob = self.conn._get_blob_segments(&blob_id, trans_handle);
-                        *cell = CellValue::BlobText(blob.unwrap());
+                        match self.conn._get_blob_segments(&blob_id, trans_handle) {
+                            Ok(blob) => *cell = CellValue::BlobText(blob),
+                            Err(e) => {
+                                // Log error instead of panic, return empty blob
+                                eprintln!("Warning: Failed to fetch text blob: {:?}", e);
+                                *cell = CellValue::BlobText(vec![]);
+                            }
+                        }
                     }
                     _ => {}
                 }

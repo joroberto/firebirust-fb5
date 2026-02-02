@@ -1,29 +1,145 @@
 //! DDL Extractor for Firebird - Based on ISQL extract.epp
-//! 
+//!
 //! Extracts complete database schema DDL exactly like `isql -x` command.
 //! Implementation follows the order and logic from Firebird source:
 //! src/isql/extract.epp
 
 use crate::{Connection, Error};
+use std::collections::HashMap;
+
+/// Database metadata including default character set
+struct DbInfo {
+    /// Default charset ID of the database
+    default_charset_id: i16,
+    /// Database file path
+    db_file: String,
+    /// Page size
+    page_size: i32,
+    /// Charset ID to name mapping (from RDB$CHARACTER_SETS)
+    charset_map: HashMap<i16, String>,
+    /// Collation (charset_id, collation_id) to name mapping (from RDB$COLLATIONS)
+    collation_map: HashMap<(i16, i16), String>,
+}
+
+impl DbInfo {
+    /// Get charset name by ID from the database's charset mapping
+    fn get_charset_name(&self, id: i16) -> &str {
+        self.charset_map.get(&id).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Get collation name by charset_id and collation_id
+    fn get_collation_name(&self, charset_id: i16, collation_id: i16) -> &str {
+        self.collation_map.get(&(charset_id, collation_id)).map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+/// Get database metadata
+fn get_db_info(conn: &mut Connection) -> Result<DbInfo, Error> {
+    // Load charset ID to name mapping from RDB$CHARACTER_SETS
+    let charset_map_sql = r#"
+        SELECT c.RDB$CHARACTER_SET_ID, c.RDB$CHARACTER_SET_NAME
+        FROM RDB$CHARACTER_SETS c
+    "#;
+
+    let mut stmt = conn.prepare(charset_map_sql)?;
+    let rows = stmt.query(())?;
+
+    let mut charset_map = HashMap::new();
+    for row in rows {
+        let id = row.get::<i16>(0).unwrap_or(0);
+        let name = row.get::<String>(1).unwrap_or_default().trim().to_string();
+        charset_map.insert(id, name);
+    }
+    drop(stmt);
+
+    // Load collation mappings from RDB$COLLATIONS
+    let collation_map_sql = r#"
+        SELECT c.RDB$CHARACTER_SET_ID, c.RDB$COLLATION_ID, c.RDB$COLLATION_NAME
+        FROM RDB$COLLATIONS c
+    "#;
+
+    let mut stmt = conn.prepare(collation_map_sql)?;
+    let rows = stmt.query(())?;
+
+    let mut collation_map = HashMap::new();
+    for row in rows {
+        let charset_id = row.get::<i16>(0).unwrap_or(0);
+        let collation_id = row.get::<i16>(1).unwrap_or(0);
+        let name = row.get::<String>(2).unwrap_or_default().trim().to_string();
+        collation_map.insert((charset_id, collation_id), name);
+    }
+    drop(stmt);
+
+    // Get default character set name
+    let charset_sql = r#"
+        SELECT r.RDB$CHARACTER_SET_NAME
+        FROM RDB$DATABASE r
+    "#;
+
+    let mut stmt = conn.prepare(charset_sql)?;
+    let rows = stmt.query(())?;
+
+    let mut default_charset_name = String::new();
+    for row in rows {
+        default_charset_name = row.get::<Option<String>>(0).ok().flatten()
+            .unwrap_or_default().trim().to_string();
+    }
+    drop(stmt);
+
+    // Find the ID for the default charset name
+    let default_charset_id = charset_map.iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(&default_charset_name))
+        .map(|(id, _)| *id)
+        .unwrap_or(0);
+
+    // Get database file and page size from MON$DATABASE
+    let mon_sql = r#"
+        SELECT m.MON$DATABASE_NAME, m.MON$PAGE_SIZE
+        FROM MON$DATABASE m
+    "#;
+
+    let mut stmt = conn.prepare(mon_sql)?;
+    let rows = stmt.query(())?;
+
+    let mut db_file = String::new();
+    let mut page_size = 16384i32;
+    for row in rows {
+        db_file = row.get::<Option<String>>(0).ok().flatten()
+            .unwrap_or_default().trim().to_string();
+        page_size = row.get::<i32>(1).unwrap_or(16384);
+    }
+    drop(stmt);
+
+    Ok(DbInfo {
+        default_charset_id,
+        db_file,
+        page_size,
+        charset_map,
+        collation_map,
+    })
+}
 
 /// Extracts complete DDL schema from the database (like isql -x)
 pub fn extract_ddl(conn: &mut Connection) -> Result<String, Error> {
     let mut output = String::new();
-    
+
+    // Get database info including default charset
+    let db_info = get_db_info(conn)?;
+
     // SET SQL DIALECT 3;
     output.push_str("SET SQL DIALECT 3;\n\n");
-    
+
     // Extract in the same order as ISQL extract.epp
-    list_create_db(conn, &mut output)?;
+    list_create_db(&db_info, &mut output)?;
     list_filters(conn, &mut output)?;
     list_charsets(conn, &mut output)?;
     list_collations(conn, &mut output)?;
     list_generators(conn, &mut output)?;
-    list_domains(conn, &mut output)?;
-    list_all_tables(conn, &mut output)?;
+    list_domains(conn, &mut output, &db_info)?;
+    list_all_tables(conn, &mut output, &db_info)?;
     list_functions_legacy(conn, &mut output)?;
     list_functions_ods12_headers(conn, &mut output)?;
-    list_procedure_headers(conn, &mut output)?;
+    list_procedure_headers(conn, &mut output, &db_info)?;
     list_package_headers(conn, &mut output)?;
     list_indexes(conn, &mut output)?;
     list_foreign(conn, &mut output)?;
@@ -37,26 +153,25 @@ pub fn extract_ddl(conn: &mut Connection) -> Result<String, Error> {
     list_relation_computed(conn, &mut output)?;
     list_all_triggers(conn, &mut output)?;
     list_all_grants(conn, &mut output)?;
-    
+
     Ok(output)
 }
 
 // ============================================================================
 // 1. CREATE DATABASE
 // ============================================================================
-fn list_create_db(_conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    // Get database info
-    let _sql = r#"
-        SELECT r.RDB$CHARACTER_SET_NAME, r.RDB$DESCRIPTION, 
-               m.RDB$PAGE_SIZE, m.RDB$PAGE_BUFFERS
-        FROM RDB$DATABASE r
-        LEFT JOIN RDB$FILES m ON m.RDB$FILE_NAME IS NULL
-    "#;
-    
-    // Simplified - just add a comment for now
-    output.push_str("\n/* CREATE DATABASE command - modify as needed */\n");
-    output.push_str("/* CREATE DATABASE 'your_database.fdb' ... */\n\n");
-    
+fn list_create_db(db_info: &DbInfo, output: &mut String) -> Result<(), Error> {
+    // Get charset name from the database's mapping
+    let charset_name = db_info.get_charset_name(db_info.default_charset_id);
+
+    // Generate CREATE DATABASE comment like ISQL does
+    output.push_str(&format!(
+        "/* CREATE DATABASE '{}' PAGE_SIZE {} DEFAULT CHARACTER SET {}; */\n\n",
+        db_info.db_file,
+        db_info.page_size,
+        charset_name
+    ));
+
     Ok(())
 }
 
@@ -174,59 +289,83 @@ fn list_generators(conn: &mut Connection, output: &mut String) -> Result<(), Err
 // ============================================================================
 // 6. DOMAINS
 // ============================================================================
-fn list_domains(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
+fn list_domains(conn: &mut Connection, output: &mut String, db_info: &DbInfo) -> Result<(), Error> {
     let sql = r#"
         SELECT f.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH,
                f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH,
                f.RDB$CHARACTER_SET_ID, f.RDB$DEFAULT_SOURCE, f.RDB$NULL_FLAG, f.RDB$SEGMENT_LENGTH,
-               f.RDB$DIMENSIONS
+               f.RDB$DIMENSIONS, f.RDB$COLLATION_ID
         FROM RDB$FIELDS f
         WHERE f.RDB$FIELD_NAME NOT STARTING WITH 'RDB$'
           AND (f.RDB$SYSTEM_FLAG IS NULL OR f.RDB$SYSTEM_FLAG <> 1)
         ORDER BY f.RDB$FIELD_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut domains = Vec::new();
     for row in rows {
         domains.push((
-            row.get::<String>(0).unwrap_or_default().trim().to_string(),
-            row.get::<i16>(1).unwrap_or(0),
-            row.get::<i16>(2).unwrap_or(0),
-            row.get::<i16>(3).unwrap_or(0),
-            row.get::<i16>(4).unwrap_or(0),
-            row.get::<i16>(5).unwrap_or(0),
-            row.get::<i16>(6).unwrap_or(0),
-            row.get::<Option<i16>>(7).ok().flatten(),
-            row.get::<Option<String>>(8).ok().flatten(),
-            row.get::<Option<i16>>(9).ok().flatten(),
-            row.get::<Option<i16>>(10).ok().flatten(),
-            row.get::<Option<i16>>(11).ok().flatten(),
+            row.get::<String>(0).unwrap_or_default().trim().to_string(),  // name
+            row.get::<i16>(1).unwrap_or(0),                                // ft (field_type)
+            row.get::<i16>(2).unwrap_or(0),                                // st (sub_type)
+            row.get::<i16>(3).unwrap_or(0),                                // len
+            row.get::<i16>(4).unwrap_or(0),                                // prec
+            row.get::<i16>(5).unwrap_or(0),                                // scale
+            row.get::<i16>(6).unwrap_or(0),                                // clen
+            row.get::<Option<i16>>(7).ok().flatten(),                      // csid (charset_id)
+            row.get::<Option<String>>(8).ok().flatten(),                   // def (default)
+            row.get::<Option<i16>>(9).ok().flatten(),                      // nullf
+            row.get::<Option<i16>>(10).ok().flatten(),                     // seglen
+            row.get::<Option<i16>>(11).ok().flatten(),                     // dims
+            row.get::<Option<i16>>(12).ok().flatten(),                     // collid (collation_id)
         ));
     }
     drop(stmt);
-    
+
     if !domains.is_empty() {
         output.push_str("/* Domain definitions */\n");
-        for (name, ft, st, len, prec, scale, clen, csid, def, nullf, seglen, dims) in domains {
+        for (name, ft, st, len, prec, scale, clen, csid, def, nullf, seglen, dims, collid) in domains {
             output.push_str(&format!("CREATE DOMAIN {} AS ", quote_identifier(&name)));
-            
-            // Format type
+
+            // Format type with segment size for BLOBs
             let type_str = format_data_type(ft, st, len, prec, scale, clen, dims, seglen);
             output.push_str(&type_str);
-            
-            // Character set
+
+            // Determine if we need to show CHARACTER SET and/or COLLATE
+            // For ISQL compatibility:
+            // - Show CHARACTER SET if charset is different from default OR if there's a non-default collation
+            // - Show COLLATE if collation_id != 0 (non-default collation)
+            let is_text_blob = ft == 261 && st == 1;
+            let is_char_type = ft == 14 || ft == 37;
+            let has_non_default_collation = collid.map(|c| c != 0).unwrap_or(false);
+
             if let Some(cs) = csid {
-                if cs > 0 {
-                    let csname = get_charset_name(cs);
-                    if !csname.is_empty() && (ft == 14 || ft == 37 || ft == 261) {
-                        output.push_str(&format!(" CHARACTER SET {}", csname));
+                let is_non_default_charset = cs != db_info.default_charset_id;
+
+                // Show CHARACTER SET if:
+                // - It's different from database default, OR
+                // - There's a non-default collation (ISQL always shows charset with collate)
+                if cs > 0 && (is_char_type || is_text_blob) {
+                    if is_non_default_charset || (is_char_type && has_non_default_collation) {
+                        let csname = db_info.get_charset_name(cs);
+                        if !csname.is_empty() {
+                            output.push_str(&format!(" CHARACTER SET {}", csname));
+                        }
+                    }
+                }
+
+                // Collation - show if different from default (collation_id != 0)
+                // Only for character types (CHAR, VARCHAR), not for BLOBs
+                if has_non_default_collation && is_char_type {
+                    let collname = db_info.get_collation_name(cs, collid.unwrap_or(0));
+                    if !collname.is_empty() {
+                        output.push_str(&format!(" COLLATE {}", collname));
                     }
                 }
             }
-            
+
             // Array dimensions
             if let Some(d) = dims {
                 if d > 0 {
@@ -234,7 +373,7 @@ fn list_domains(conn: &mut Connection, output: &mut String) -> Result<(), Error>
                     output.push_str(&format!(" /* {} dimensions */", d));
                 }
             }
-            
+
             // Default
             if let Some(ref d) = def {
                 let trimmed = d.trim();
@@ -242,24 +381,24 @@ fn list_domains(conn: &mut Connection, output: &mut String) -> Result<(), Error>
                     output.push_str(&format!("\n         {}", trimmed));
                 }
             }
-            
+
             // NOT NULL
             if nullf == Some(1) {
                 output.push_str(" NOT NULL");
             }
-            
+
             output.push_str(";\n");
         }
         output.push_str("\n");
     }
-    
+
     Ok(())
 }
 
 // ============================================================================
 // 7. TABLES
 // ============================================================================
-fn list_all_tables(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
+fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo) -> Result<(), Error> {
     // Get all user tables (not views)
     let sql = r#"
         SELECT r.RDB$RELATION_NAME, r.RDB$OWNER_NAME, r.RDB$RELATION_TYPE
@@ -443,7 +582,7 @@ fn list_functions_ods12_headers(_conn: &mut Connection, _output: &mut String) ->
 // ============================================================================
 // 10. PROCEDURE HEADERS
 // ============================================================================
-fn list_procedure_headers(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
+fn list_procedure_headers(conn: &mut Connection, output: &mut String, db_info: &DbInfo) -> Result<(), Error> {
     // Get procedures with their source code to output CREATE OR ALTER PROCEDURE like ISQL
     let sql = r#"
         SELECT p.RDB$PROCEDURE_NAME, p.RDB$OWNER_NAME, p.RDB$PROCEDURE_SOURCE
@@ -505,11 +644,11 @@ fn list_procedure_headers(conn: &mut Connection, output: &mut String) -> Result<
 
                 let mut type_str = format_data_type(ft, st, len, prec, scale, clen, None, None);
 
-                // Add character set for string types if not default
+                // Add character set for string types if different from database default
                 if let Some(cs) = csid {
-                    if cs > 0 && (ft == 14 || ft == 37) {
-                        let csname = get_charset_name(cs);
-                        if !csname.is_empty() && csname != "NONE" {
+                    if cs > 0 && cs != db_info.default_charset_id && (ft == 14 || ft == 37) {
+                        let csname = db_info.get_charset_name(cs);
+                        if !csname.is_empty() {
                             type_str.push_str(&format!(" CHARACTER SET {}", csname));
                         }
                     }
@@ -1444,11 +1583,22 @@ fn format_data_type(ft: i16, st: i16, len: i16, prec: i16, scale: i16, clen: i16
             format!("CSTRING({})", l)
         }
         261 => {
-            // BLOB
+            // BLOB - include SEGMENT SIZE if specified (non-zero)
+            let seg = seglen.unwrap_or(0);
             let sub = if st == 1 {
-                "SUB_TYPE TEXT".to_string()
+                // Text blob
+                if seg > 0 {
+                    format!("SUB_TYPE TEXT SEGMENT SIZE {}", seg)
+                } else {
+                    "SUB_TYPE TEXT".to_string()
+                }
             } else if st == 0 {
-                format!("SUB_TYPE 0 SEGMENT SIZE {}", seglen.unwrap_or(80))
+                // Binary blob
+                if seg > 0 {
+                    format!("SUB_TYPE 0 SEGMENT SIZE {}", seg)
+                } else {
+                    "SUB_TYPE 0".to_string()
+                }
             } else {
                 format!("SUB_TYPE {}", st)
             };
@@ -1517,6 +1667,66 @@ fn get_charset_name(id: i16) -> &'static str {
         59 => "CYRL",
         60 => "DOS_437",
         _ => "",
+    }
+}
+
+/// Get character set ID by name (must match get_charset_name exactly)
+fn get_charset_id(name: &str) -> i16 {
+    match name.to_uppercase().as_str() {
+        "NONE" => 0,
+        "OCTETS" => 1,
+        "ASCII" => 2,
+        "UNICODE_FSS" => 3,
+        "UTF8" => 4,
+        "SJIS_0208" => 5,
+        "EUCJ_0208" => 6,
+        "DOS437" => 9,
+        "DOS850" => 10,
+        "DOS865" => 11,
+        "DOS861" => 12,
+        "DOS895" => 13,
+        "BIG_5" => 14,
+        "GB2312" => 15,
+        "DOS857" => 16,
+        "DOS863" => 17,
+        "DOS860" => 18,
+        "ISO8859_1" => 19,
+        "ISO8859_2" => 20,
+        "KSC_5601" => 21,
+        "DOS862" => 22,
+        "DOS864" => 23,
+        "ISO8859_3" => 24,
+        "ISO8859_4" => 25,
+        "ISO8859_5" => 26,
+        "ISO8859_6" => 27,
+        "ISO8859_7" => 28,
+        "ISO8859_8" => 29,
+        "ISO8859_9" => 30,
+        "ISO8859_13" => 31,
+        "ISO8859_15" => 32,
+        "KOI8R" => 34,
+        "KOI8U" => 35,
+        "WIN1250" => 36,
+        "WIN1251" => 37,
+        "WIN1252" => 38,
+        "WIN1253" => 39,
+        "WIN1254" => 40,
+        "WIN1255" => 41,
+        "WIN1256" => 42,
+        "WIN1257" => 43,
+        "WIN1258" => 44,
+        "WIN_1258" => 45,
+        "ISO8859_10" => 46,
+        "ISO8859_11" => 47,
+        "ISO8859_14" => 48,
+        "DOS737" => 52,
+        "DOS775" => 53,
+        "DOS858" => 54,
+        "DOS866" => 57,
+        "DOS869" => 58,
+        "CYRL" => 59,
+        "DOS_437" => 60,
+        _ => 0,
     }
 }
 

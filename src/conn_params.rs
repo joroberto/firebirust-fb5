@@ -65,6 +65,9 @@ impl ConnParams {
         if slash_count == 1 {
             // "/foo.fdb" -> "foo.fdb"
             db_name = db_name[1..].to_string();
+        } else if db_name.len() > 3 && db_name.as_bytes()[0] == b'/' && db_name.as_bytes()[2] == b':' {
+            // Windows path fix: "/C:/path/file.fdb" -> "C:/path/file.fdb"
+            db_name = db_name[1..].to_string();
         }
 
         let mut options: HashMap<String, String> = url.query_pairs().into_owned().collect();

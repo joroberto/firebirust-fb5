@@ -69,6 +69,10 @@ impl Row {
             )))
         }
     }
+
+    pub fn cells(&self) -> &[CellValue] {
+        &self.row
+    }
 }
 
 pub struct MappedRows<F> {

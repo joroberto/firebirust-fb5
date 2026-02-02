@@ -215,9 +215,21 @@ impl ToSqlParam for Param {
                 blr.write(&[27]).unwrap();
             }
             Param::Blob(b) => {
-                let (b, v) = utils::bytes_to_blr(b);
-                value.write(&v).unwrap();
-                blr.write(&b).unwrap();
+                // For blobs > 32KB, use BLR 9 (blr_quad) as a marker.
+                // The wireprotocol will detect this and use create_blob() properly.
+                // For small blobs, inline them like text.
+                const INLINE_BLOB_LIMIT: usize = 32 * 1024;
+                if b.len() > INLINE_BLOB_LIMIT {
+                    // BLR 9 = blr_quad (blob reference, 8 bytes)
+                    // We put the raw data in value; wireprotocol will handle it
+                    blr.write(&[9, 0]).unwrap();
+                    value.write(b).unwrap();
+                } else {
+                    // Small blobs can be inlined like text
+                    let (b, v) = utils::bytes_to_blr(b);
+                    value.write(&v).unwrap();
+                    blr.write(&b).unwrap();
+                }
             }
             Param::TimeStampTZ(_dt_tz) => {
                 // TODO:

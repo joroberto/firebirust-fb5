@@ -25,6 +25,7 @@
 use std::io::prelude::*;
 use std::str;
 
+use encoding_rs::Encoding;
 use chrono;
 use chrono::TimeZone;
 use chrono_tz;
@@ -81,11 +82,23 @@ pub fn f64_to_bytes(f: f64) -> [u8; 8] {
 }
 
 pub fn bytes_to_str(b: &[u8]) -> String {
-    str::from_utf8(b).unwrap().to_string()
+    if let Ok(s) = str::from_utf8(b) {
+        return s.to_string();
+    }
+    // Fallback to ISO-8859-1 for legacy databases
+    let enc = Encoding::for_label(b"iso-8859-1").unwrap();
+    let (cow, _, _) = enc.decode(b);
+    cow.into_owned()
 }
 
 pub fn bytes_to_rtrim_str(b: &[u8]) -> String {
-    str::from_utf8(b).unwrap().trim_end().to_string()
+    if let Ok(s) = str::from_utf8(b) {
+        return s.trim_end().to_string();
+    }
+    // Fallback to ISO-8859-1 for legacy databases
+    let enc = Encoding::for_label(b"iso-8859-1").unwrap();
+    let (cow, _, _) = enc.decode(b);
+    cow.trim_end().to_string()
 }
 
 pub fn bytes_to_int32(b: &[u8]) -> i32 {
@@ -197,7 +210,8 @@ pub fn bytes_to_f64(b: &[u8]) -> f64 {
 }
 
 pub fn bytes_to_naive_date(b: &[u8]) -> chrono::NaiveDate {
-    let mut nday = bytes_to_buint32(b) + 678882;
+    // Use i64 to prevent overflow with old dates
+    let mut nday = bytes_to_bint32(b) as i64 + 678882;
     let century = (4 * nday - 1) / 146097;
     nday = 4 * nday - 1 - 146097 * century;
     let mut day = nday / 4;
@@ -217,7 +231,7 @@ pub fn bytes_to_naive_date(b: &[u8]) -> chrono::NaiveDate {
         year += 1;
     }
 
-    chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32).unwrap()
 }
 
 pub fn bytes_to_naive_time(b: &[u8]) -> chrono::NaiveTime {
@@ -345,11 +359,12 @@ pub fn bytes_to_blr(b: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 pub fn convert_date(year: i32, month: u32, day: u32) -> [u8; 4] {
     // Convert date to BLR format data
-    let i = month + 9;
-    let jy = year as u32 + (i / 12) - 1;
+    // Use i64 to prevent overflow with old dates
+    let i = month as i64 + 9;
+    let jy = year as i64 + (i / 12) - 1;
     let jm = i % 12;
     let c = jy / 100;
-    let j = (146097 * c) / 4 + (1461 * (jy - 100 * c)) / 4 + (153 * jm + 2) / 5 + day - 678882;
+    let j = (146097 * c) / 4 + (1461 * (jy - 100 * c)) / 4 + (153 * jm + 2) / 5 + day as i64 - 678882;
     bint32_to_bytes(j as i32)
 }
 

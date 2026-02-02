@@ -980,16 +980,21 @@ impl WireProtocol {
         params: &[(Vec<u8>, Vec<u8>, bool)],
     ) -> Result<(), Error> {
         debug_print!("op_execute()");
+
+        // Pre-process blob parameters BEFORE building the execute packet
+        // This creates blobs via separate network operations first
+        let processed_params = self.preprocess_blob_params(params, trans_handle)?;
+
         self.pack_u32(OP_EXECUTE);
         self.pack_u32(stmt_handle as u32);
         self.pack_u32(trans_handle as u32);
 
-        if params.len() == 0 {
+        if processed_params.len() == 0 {
             self.pack_u32(0);
             self.pack_u32(0);
             self.pack_u32(0);
         } else {
-            let (values, blr) = self.params_to_blr(params)?;
+            let (values, blr) = self.params_to_blr(&processed_params)?;
             self.pack_bytes(&blr);
             self.pack_u32(0);
             self.pack_u32(1);
@@ -1012,16 +1017,20 @@ impl WireProtocol {
         output_blr: &[u8],
     ) -> Result<(), Error> {
         debug_print!("op_execute2()");
+
+        // Pre-process blob parameters BEFORE building the execute packet
+        let processed_params = self.preprocess_blob_params(params, trans_handle)?;
+
         self.pack_u32(OP_EXECUTE2);
         self.pack_u32(stmt_handle as u32);
         self.pack_u32(trans_handle as u32);
 
-        if params.len() == 0 {
+        if processed_params.len() == 0 {
             self.pack_u32(0);
             self.pack_u32(0);
             self.pack_u32(0);
         } else {
-            let (values, blr) = self.params_to_blr(params)?;
+            let (values, blr) = self.params_to_blr(&processed_params)?;
             self.pack_bytes(&blr);
             self.pack_u32(0);
             self.pack_u32(1);
@@ -1081,7 +1090,10 @@ impl WireProtocol {
 
         if opcode != OP_FETCH_RESPONSE {
             self.parse_op_response()?;
-            panic!("op fetch response error"); // not reach
+            return Err(Error::FirebirdError(FirebirdError::new(
+                "op fetch response error",
+                0,
+            )));
         }
 
         let mut status = utils::bytes_to_buint32(&self.recv_packets(4)?);
@@ -1094,16 +1106,20 @@ impl WireProtocol {
             if xsqlda_len % 8 != 0 {
                 n += 1;
             }
-            let mut null_indicator: u128 = 0;
-            let b = &self.recv_packets_alignment(n)?;
-            for c in b.iter().rev() {
-                null_indicator <<= 8;
-                null_indicator += *c as u128;
-            }
+            // Read null bitmap bytes directly instead of u128 to support >128 columns
+            let null_bytes = self.recv_packets_alignment(n)?;
 
             let mut row: Vec<CellValue> = Vec::with_capacity(xsqlda_len);
             for (i, x) in xsqlda.iter().enumerate() {
-                if (null_indicator & (1 << i)) != 0 {
+                // Check null bit in the byte array
+                let byte_index = i / 8;
+                let bit_index = i % 8;
+                let is_null = if byte_index < null_bytes.len() {
+                    (null_bytes[byte_index] & (1u8 << bit_index)) != 0
+                } else {
+                    false
+                };
+                if is_null {
                     row.push(CellValue::Null)
                 } else {
                     let ln = if x.io_length() < 0 {
@@ -1402,6 +1418,31 @@ impl WireProtocol {
         Ok(blob_id)
     }
 
+    /// Pre-process parameters to create blobs BEFORE building the execute packet.
+    /// This avoids calling create_blob() while building the packet.
+    fn preprocess_blob_params(
+        &mut self,
+        params: &[(Vec<u8>, Vec<u8>, bool)],
+        trans_handle: i32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, bool)>, Error> {
+        let mut result = Vec::with_capacity(params.len());
+
+        for p in params.iter() {
+            // Check if this is a large blob marker (BLR[0] == 9)
+            if p.1.len() >= 2 && p.1[0] == 9 && !p.2 {
+                // Large blob: create it now and replace with blob_id
+                let blob_id = self.create_blob(&p.0, trans_handle)?;
+                // BLR 9 (blr_quad) with scale 0 for blob reference
+                result.push((blob_id, vec![9, 0], false));
+            } else {
+                // Keep parameter as-is
+                result.push((p.0.clone(), p.1.clone(), p.2));
+            }
+        }
+
+        Ok(result)
+    }
+
     fn params_to_blr(
         &mut self,
         params: &[(Vec<u8>, Vec<u8>, bool)],
@@ -1412,26 +1453,30 @@ impl WireProtocol {
         let blr = vec![5, 2, 4, 0, (ln & 0xFF) as u8, ((ln >> 8) & 0xFF) as u8];
         blr_list.write(&blr)?;
 
-        let mut null_indicator: u128 = 0;
-        for (i, (_value, _blr, isnull)) in params.iter().enumerate() {
-            if *isnull {
-                null_indicator |= 1 << i;
-            }
-        }
-
+        // Calculate null bitmap size (supports >128 columns)
         let mut n = params.len() / 8;
         if params.len() % 8 != 0 {
             n += 1;
         }
         if (n % 4) != 0 {
-            // padding
+            // padding to 4-byte boundary
             n += 4 - n % 4;
         }
 
-        for _ in 0..n {
-            values_list.push((null_indicator & 255) as u8);
-            null_indicator >>= 8;
+        // Build null bitmap using byte array (not u128) to support unlimited columns
+        let mut null_bytes: Vec<u8> = vec![0u8; n];
+        for (i, (_value, _blr, isnull)) in params.iter().enumerate() {
+            if *isnull {
+                let byte_index = i / 8;
+                let bit_index = i % 8;
+                if byte_index < null_bytes.len() {
+                    null_bytes[byte_index] |= 1u8 << bit_index;
+                }
+            }
         }
+
+        // Write null bitmap to values
+        values_list.write(&null_bytes)?;
 
         for p in params.iter() {
             values_list.write(&p.0)?;
@@ -1446,7 +1491,9 @@ impl WireProtocol {
 
 impl Drop for WireProtocol {
     fn drop(&mut self) {
-        self.op_detach().unwrap();
-        let _ = self.op_response();
+        // Silently ignore errors during cleanup - Drop implementations should never panic
+        if let Ok(()) = self.op_detach() {
+            let _ = self.op_response();
+        }
     }
 }

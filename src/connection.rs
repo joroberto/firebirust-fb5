@@ -317,19 +317,23 @@ impl Connection {
 
     pub(crate) fn _free_statement(&self, stmt_handle: i32, drop_type: i32) -> () {
         let mut wp = self.wp.borrow_mut();
-        wp.op_free_statement(stmt_handle, drop_type).unwrap();
-        if (wp.accept_type & PTYPE_MASK) == PTYPE_LAZY_SEND {
-            wp.lazy_response_count += 1;
-        } else {
-            wp.op_response().unwrap();
+        // Silently ignore errors during cleanup - Drop implementations should never panic
+        if let Ok(()) = wp.op_free_statement(stmt_handle, drop_type) {
+            if (wp.accept_type & PTYPE_MASK) == PTYPE_LAZY_SEND {
+                wp.lazy_response_count += 1;
+            } else {
+                let _ = wp.op_response();
+            }
         }
     }
 
     // methods for Transaction
     pub(crate) fn drop_transaction(&self, trans_handle: i32) -> () {
         let mut wp = self.wp.borrow_mut();
-        wp.op_rollback(trans_handle).unwrap();
-        wp.op_response().unwrap();
+        // Silently ignore errors during cleanup - Drop implementations should never panic
+        if let Ok(()) = wp.op_rollback(trans_handle) {
+            let _ = wp.op_response();
+        }
     }
 
     // ===== Event Methods (POST_EVENT support) =====
