@@ -37,9 +37,11 @@ use super::*;
 const SRP_KEY_SIZE: usize = 128;
 const SRP_SALT_SIZE: usize = 32;
 
-const SRP_DEBUG: bool = true;
+// Debug constants - only available in test builds
+#[cfg(test)]
 const DEBUG_PRIVATE_KEY: &'static [u8; 64] =
     b"60975527035CF2AD1989806F0407210BC81EDC04E2762A56AFD529DDDA2D4393";
+#[cfg(test)]
 const DEBUG_SALT: &str = "02E268803000000079A478A700000002D1A6979000000026E1601C000000054F";
 
 fn pad(v: &BigInt) -> Vec<u8> {
@@ -87,22 +89,14 @@ pub fn get_user_hash(salt: &[u8], user: &str, password: &str) -> BigInt {
 
 pub fn get_client_seed() -> (BigInt, BigInt) {
     let (prime, g, _) = get_prime();
-    let key_private_a: BigInt;
-    if SRP_DEBUG {
-        key_private_a = utils::big_int_from_hex_string(DEBUG_PRIVATE_KEY);
-    } else {
-        let r: u128 = random();
-        key_private_a = BigInt::from(r);
-    }
+    let r: u128 = random();
+    let key_private_a = BigInt::from(r);
 
     let key_public_a = g.modpow(&key_private_a, &prime);
     (key_public_a, key_private_a)
 }
 
 pub fn get_salt() -> Vec<u8> {
-    if SRP_DEBUG {
-        return hex::decode(DEBUG_SALT).unwrap();
-    }
     let mut buf: Vec<u8> = Vec::new();
     for _ in 0..SRP_SALT_SIZE {
         buf.push(random());
@@ -119,14 +113,8 @@ pub fn get_verifier(user: &str, password: &str, salt: &Vec<u8>) -> BigInt {
 
 pub fn get_server_seed(v: &BigInt) -> (BigInt, BigInt) {
     let (prime, g, k) = get_prime();
-    let key_private_b: BigInt;
-
-    if SRP_DEBUG {
-        key_private_b = utils::big_int_from_hex_string(DEBUG_PRIVATE_KEY);
-    } else {
-        let r: u128 = random();
-        key_private_b = BigInt::from(r);
-    }
+    let r: u128 = random();
+    let key_private_b = BigInt::from(r);
 
     let gb = g.modpow(&key_private_b, &prime); // gb = pow(g, b, N)
     let kv = (&k * v) % &prime; // kv = (k * v) % N

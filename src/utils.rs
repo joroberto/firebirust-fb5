@@ -93,12 +93,12 @@ pub fn bytes_to_str(b: &[u8]) -> String {
 
 pub fn bytes_to_rtrim_str(b: &[u8]) -> String {
     if let Ok(s) = str::from_utf8(b) {
-        return s.trim_end().to_string();
+        return s.trim_end_matches(' ').to_string();
     }
     // Fallback to ISO-8859-1 for legacy databases
     let enc = Encoding::for_label(b"iso-8859-1").unwrap();
     let (cow, _, _) = enc.decode(b);
-    cow.trim_end().to_string()
+    cow.trim_end_matches(' ').to_string()
 }
 
 pub fn bytes_to_int32(b: &[u8]) -> i32 {
