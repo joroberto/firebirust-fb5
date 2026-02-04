@@ -184,19 +184,68 @@ impl Statement<'_> {
 
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows, Error> {
         params.__bind_in(self)?;
-        self.last_rowcount = self.conn._execute_statement(
-            self.trans_handle,
-            self.stmt_handle,
-            self.stmt_type,
-            self.params.as_slice(),
-        )?;
         let mut rows: VecDeque<Vec<CellValue>> = VecDeque::new();
+
         if self.stmt_type == ISC_INFO_SQL_STMT_SELECT {
-            rows = self.fetch_records(self.trans_handle)?;
+            // Pipeline execute+fetch: sends both ops before reading responses
+            let blr = self.calc_blr();
+            let (first_batch, more_data) = self.conn._execute_and_fetch(
+                self.trans_handle,
+                self.stmt_handle,
+                self.params.as_slice(),
+                &blr,
+                &self.xsqlda,
+            )?;
+            rows.extend(first_batch);
+
+            // Fetch remaining rows if more data available
+            if more_data {
+                loop {
+                    let (batch, more) = self.conn._fetch(self.stmt_handle, &blr, &self.xsqlda)?;
+                    rows.extend(batch);
+                    if !more { break; }
+                }
+            }
+
+            // Resolve blob references
+            for row in rows.iter_mut() {
+                for cell in row.iter_mut() {
+                    match cell {
+                        CellValue::BlobBinary(blob_id) => {
+                            match self.conn._get_blob_segments(&blob_id, self.trans_handle) {
+                                Ok(blob) => *cell = CellValue::BlobBinary(blob),
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to fetch binary blob: {:?}", e);
+                                    *cell = CellValue::BlobBinary(vec![]);
+                                }
+                            }
+                        }
+                        CellValue::BlobText(blob_id) => {
+                            match self.conn._get_blob_segments(&blob_id, self.trans_handle) {
+                                Ok(blob) => *cell = CellValue::BlobText(blob),
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to fetch text blob: {:?}", e);
+                                    *cell = CellValue::BlobText(vec![]);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             self.conn._free_statement(self.stmt_handle, DSQL_CLOSE);
-        } else if self.autocommit {
-            // commit automatically
-            self.conn.commit()?;
+            self.last_rowcount = 0;
+        } else {
+            self.last_rowcount = self.conn._execute_statement(
+                self.trans_handle,
+                self.stmt_handle,
+                self.stmt_type,
+                self.params.as_slice(),
+            )?;
+            if self.autocommit {
+                self.conn.commit()?;
+            }
         }
 
         Ok(Rows::new(rows))

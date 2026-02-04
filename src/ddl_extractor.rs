@@ -6,6 +6,24 @@
 
 use crate::{Connection, Error};
 use std::collections::HashMap;
+use std::time::Instant;
+
+/// Check if DDL profiling is enabled via FB_DDL_PROFILE=1
+fn is_profiling() -> bool {
+    std::env::var("FB_DDL_PROFILE").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Profile helper: measure and print elapsed time for a DDL extraction step
+macro_rules! profile_step {
+    ($name:expr, $conn:expr, $output:expr, $call:expr) => {{
+        let start = Instant::now();
+        let result = $call;
+        if is_profiling() {
+            eprintln!("  DDL {:30} {:>8.1}ms", $name, start.elapsed().as_secs_f64() * 1000.0);
+        }
+        result
+    }};
+}
 
 /// Database metadata including default character set
 struct DbInfo {
@@ -31,6 +49,220 @@ impl DbInfo {
     fn get_collation_name(&self, charset_id: i16, collation_id: i16) -> &str {
         self.collation_map.get(&(charset_id, collation_id)).map(|s| s.as_str()).unwrap_or("")
     }
+}
+
+/// Pre-fetched metadata to eliminate N+1 queries.
+/// All data is loaded in ~7 bulk queries instead of ~1000 per-object queries.
+struct BulkMetadata {
+    /// table_name → Vec of (field_name, field_type, sub_type, length, precision, scale, char_length,
+    ///   default_source, null_flag, computed_source, field_source, collation_id, generator_name, identity_type)
+    table_columns: HashMap<String, Vec<(String, i16, i16, i16, i16, i16, i16, Option<String>, Option<i16>, Option<String>, String, Option<i16>, Option<String>, Option<i16>)>>,
+    /// index_name → Vec of field_names (ordered by position)
+    index_segments: HashMap<String, Vec<String>>,
+    /// table_name → Vec of (constraint_name, constraint_type, index_name)
+    table_constraints: HashMap<String, Vec<(String, String, String)>>,
+    /// index_name → (index_type, index_name)
+    index_info: HashMap<String, (Option<i16>, String)>,
+    /// constraint_name → index_name (for ALL constraints including FKs)
+    constraint_index: HashMap<String, String>,
+    /// procedure_name → Vec of (param_name, param_type, field_type, sub_type, length, precision, scale, char_length, null_flag, charset_id)
+    proc_params: HashMap<String, Vec<(String, i16, i16, i16, i16, i16, i16, i16, Option<i16>, Option<i16>)>>,
+    /// view_name → Vec of field_names (ordered by position)
+    view_columns: HashMap<String, Vec<String>>,
+}
+
+fn prefetch_metadata(conn: &mut Connection) -> Result<BulkMetadata, Error> {
+    let profiling = is_profiling();
+
+    // 1. ALL table columns (replaces ~200 per-table queries)
+    let start = Instant::now();
+    let col_sql = r#"
+        SELECT rf.RDB$RELATION_NAME, rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
+               f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE,
+               f.RDB$CHARACTER_LENGTH, rf.RDB$DEFAULT_SOURCE, rf.RDB$NULL_FLAG,
+               f.RDB$COMPUTED_SOURCE, rf.RDB$FIELD_SOURCE, rf.RDB$COLLATION_ID,
+               rf.RDB$GENERATOR_NAME, rf.RDB$IDENTITY_TYPE
+        FROM RDB$RELATION_FIELDS rf
+        JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+        JOIN RDB$RELATIONS r ON rf.RDB$RELATION_NAME = r.RDB$RELATION_NAME
+        WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
+          AND r.RDB$VIEW_BLR IS NULL
+        ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION
+    "#;
+    let mut table_columns: HashMap<String, Vec<_>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(col_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let tname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let entry = (
+                row.get::<String>(1).unwrap_or_default().trim().to_string(),
+                row.get::<i16>(2).unwrap_or(0),
+                row.get::<i16>(3).unwrap_or(0),
+                row.get::<i16>(4).unwrap_or(0),
+                row.get::<i16>(5).unwrap_or(0),
+                row.get::<i16>(6).unwrap_or(0),
+                row.get::<i16>(7).unwrap_or(0),
+                row.get::<Option<String>>(8).ok().flatten(),
+                row.get::<Option<i16>>(9).ok().flatten(),
+                row.get::<Option<String>>(10).ok().flatten(),
+                row.get::<String>(11).unwrap_or_default().trim().to_string(),
+                row.get::<Option<i16>>(12).ok().flatten(),
+                row.get::<Option<String>>(13).ok().flatten(),
+                row.get::<Option<i16>>(14).ok().flatten(),
+            );
+            table_columns.entry(tname).or_default().push(entry);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:table_columns", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 2. ALL index segments (replaces ~300 per-index/constraint/FK queries)
+    let start = Instant::now();
+    let seg_sql = r#"
+        SELECT s.RDB$INDEX_NAME, s.RDB$FIELD_NAME
+        FROM RDB$INDEX_SEGMENTS s
+        ORDER BY s.RDB$INDEX_NAME, s.RDB$FIELD_POSITION
+    "#;
+    let mut index_segments: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(seg_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let iname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let fname = row.get::<String>(1).unwrap_or_default().trim().to_string();
+            index_segments.entry(iname).or_default().push(fname);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:index_segments", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 3. ALL table constraints PK/UNIQUE (replaces per-table constraint queries)
+    let start = Instant::now();
+    let cons_sql = r#"
+        SELECT rc.RDB$RELATION_NAME, rc.RDB$CONSTRAINT_NAME, rc.RDB$CONSTRAINT_TYPE, rc.RDB$INDEX_NAME
+        FROM RDB$RELATION_CONSTRAINTS rc
+        JOIN RDB$RELATIONS r ON rc.RDB$RELATION_NAME = r.RDB$RELATION_NAME
+        WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
+          AND (rc.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY' OR rc.RDB$CONSTRAINT_TYPE = 'UNIQUE')
+        ORDER BY rc.RDB$RELATION_NAME, rc.RDB$CONSTRAINT_TYPE, rc.RDB$CONSTRAINT_NAME
+    "#;
+    let mut table_constraints: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(cons_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let tname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let entry = (
+                row.get::<String>(1).unwrap_or_default().trim().to_string(),
+                row.get::<String>(2).unwrap_or_default().trim().to_string(),
+                row.get::<String>(3).unwrap_or_default().trim().to_string(),
+            );
+            table_constraints.entry(tname).or_default().push(entry);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:table_constraints", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 4. ALL index info (replaces per-constraint index type check)
+    let start = Instant::now();
+    let idx_sql = r#"
+        SELECT i.RDB$INDEX_NAME, i.RDB$INDEX_TYPE
+        FROM RDB$INDICES i
+    "#;
+    let mut index_info: HashMap<String, (Option<i16>, String)> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(idx_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let iname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let itype = row.get::<Option<i16>>(1).ok().flatten();
+            index_info.insert(iname.clone(), (itype, iname));
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:index_info", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 4b. ALL constraint → index mappings (for FK column lookups)
+    let start = Instant::now();
+    let ci_sql = r#"
+        SELECT rc.RDB$CONSTRAINT_NAME, rc.RDB$INDEX_NAME
+        FROM RDB$RELATION_CONSTRAINTS rc
+    "#;
+    let mut constraint_index: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(ci_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let cname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let iname = row.get::<String>(1).unwrap_or_default().trim().to_string();
+            constraint_index.insert(cname, iname);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:constraint_index", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 5. ALL procedure parameters (replaces per-procedure param queries)
+    let start = Instant::now();
+    let param_sql = r#"
+        SELECT p.RDB$PROCEDURE_NAME, p.RDB$PARAMETER_NAME, p.RDB$PARAMETER_TYPE,
+               f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH,
+               f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH,
+               p.RDB$NULL_FLAG, f.RDB$CHARACTER_SET_ID
+        FROM RDB$PROCEDURE_PARAMETERS p
+        JOIN RDB$FIELDS f ON p.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+        WHERE p.RDB$PACKAGE_NAME IS NULL
+        ORDER BY p.RDB$PROCEDURE_NAME, p.RDB$PARAMETER_TYPE, p.RDB$PARAMETER_NUMBER
+    "#;
+    let mut proc_params: HashMap<String, Vec<_>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(param_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let pname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let entry = (
+                row.get::<String>(1).unwrap_or_default().trim().to_string(),
+                row.get::<i16>(2).unwrap_or(0),
+                row.get::<i16>(3).unwrap_or(0),
+                row.get::<i16>(4).unwrap_or(0),
+                row.get::<i16>(5).unwrap_or(0),
+                row.get::<i16>(6).unwrap_or(0),
+                row.get::<i16>(7).unwrap_or(0),
+                row.get::<i16>(8).unwrap_or(0),
+                row.get::<Option<i16>>(9).ok().flatten(),
+                row.get::<Option<i16>>(10).ok().flatten(),
+            );
+            proc_params.entry(pname).or_default().push(entry);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:proc_params", start.elapsed().as_secs_f64() * 1000.0); }
+
+    // 6. ALL view columns (replaces per-view column queries)
+    let start = Instant::now();
+    let vcol_sql = r#"
+        SELECT rf.RDB$RELATION_NAME, rf.RDB$FIELD_NAME
+        FROM RDB$RELATION_FIELDS rf
+        JOIN RDB$RELATIONS r ON rf.RDB$RELATION_NAME = r.RDB$RELATION_NAME
+        WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
+          AND r.RDB$VIEW_BLR IS NOT NULL
+        ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION
+    "#;
+    let mut view_columns: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(vcol_sql)?;
+        let rows = stmt.query(())?;
+        for row in rows {
+            let vname = row.get::<String>(0).unwrap_or_default().trim().to_string();
+            let fname = row.get::<String>(1).unwrap_or_default().trim().to_string();
+            view_columns.entry(vname).or_default().push(fname);
+        }
+    }
+    if profiling { eprintln!("  DDL {:30} {:>8.1}ms", "prefetch:view_columns", start.elapsed().as_secs_f64() * 1000.0); }
+
+    Ok(BulkMetadata {
+        table_columns,
+        index_segments,
+        table_constraints,
+        index_info,
+        constraint_index,
+        proc_params,
+        view_columns,
+    })
 }
 
 /// Get database metadata
@@ -121,38 +353,46 @@ fn get_db_info(conn: &mut Connection) -> Result<DbInfo, Error> {
 
 /// Extracts complete DDL schema from the database (like isql -x)
 pub fn extract_ddl(conn: &mut Connection) -> Result<String, Error> {
+    let total_start = Instant::now();
     let mut output = String::new();
 
     // Get database info including default charset
-    let db_info = get_db_info(conn)?;
+    let db_info = profile_step!("get_db_info", conn, output, get_db_info(conn))?;
+
+    // Pre-fetch all metadata in ~6 bulk queries (replaces ~800+ per-object queries)
+    let bulk = profile_step!("prefetch_metadata", conn, output, prefetch_metadata(conn))?;
 
     // SET SQL DIALECT 3;
     output.push_str("SET SQL DIALECT 3;\n\n");
 
     // Extract in the same order as ISQL extract.epp
     list_create_db(&db_info, &mut output)?;
-    list_filters(conn, &mut output)?;
-    list_charsets(conn, &mut output)?;
-    list_collations(conn, &mut output)?;
-    list_generators(conn, &mut output)?;
-    list_domains(conn, &mut output, &db_info)?;
-    list_all_tables(conn, &mut output, &db_info)?;
-    list_functions_legacy(conn, &mut output)?;
-    list_functions_ods12_headers(conn, &mut output)?;
-    list_procedure_headers(conn, &mut output, &db_info)?;
-    list_package_headers(conn, &mut output)?;
-    list_indexes(conn, &mut output)?;
-    list_foreign(conn, &mut output)?;
-    list_views(conn, &mut output)?;
-    list_exceptions(conn, &mut output)?;
-    list_functions_ods12_bodies(conn, &mut output)?;
-    list_procedure_bodies(conn, &mut output)?;
-    list_package_bodies(conn, &mut output)?;
-    list_domain_constraints(conn, &mut output)?;
-    list_check(conn, &mut output)?;
-    list_relation_computed(conn, &mut output)?;
-    list_all_triggers(conn, &mut output)?;
-    list_all_grants(conn, &mut output)?;
+    profile_step!("list_filters", conn, output, list_filters(conn, &mut output))?;
+    profile_step!("list_charsets", conn, output, list_charsets(conn, &mut output))?;
+    profile_step!("list_collations", conn, output, list_collations(conn, &mut output))?;
+    profile_step!("list_generators", conn, output, list_generators(conn, &mut output))?;
+    profile_step!("list_domains", conn, output, list_domains(conn, &mut output, &db_info))?;
+    profile_step!("list_all_tables", conn, output, list_all_tables(conn, &mut output, &db_info, &bulk))?;
+    profile_step!("list_functions_legacy", conn, output, list_functions_legacy(conn, &mut output))?;
+    profile_step!("list_functions_ods12_headers", conn, output, list_functions_ods12_headers(conn, &mut output))?;
+    profile_step!("list_procedure_headers", conn, output, list_procedure_headers(conn, &mut output, &db_info, &bulk))?;
+    profile_step!("list_package_headers", conn, output, list_package_headers(conn, &mut output))?;
+    profile_step!("list_indexes", conn, output, list_indexes(conn, &mut output, &bulk))?;
+    profile_step!("list_foreign", conn, output, list_foreign(conn, &mut output, &bulk))?;
+    profile_step!("list_views", conn, output, list_views(conn, &mut output, &bulk))?;
+    profile_step!("list_exceptions", conn, output, list_exceptions(conn, &mut output))?;
+    profile_step!("list_functions_ods12_bodies", conn, output, list_functions_ods12_bodies(conn, &mut output))?;
+    profile_step!("list_procedure_bodies", conn, output, list_procedure_bodies(conn, &mut output))?;
+    profile_step!("list_package_bodies", conn, output, list_package_bodies(conn, &mut output))?;
+    profile_step!("list_domain_constraints", conn, output, list_domain_constraints(conn, &mut output))?;
+    profile_step!("list_check", conn, output, list_check(conn, &mut output))?;
+    profile_step!("list_relation_computed", conn, output, list_relation_computed(conn, &mut output))?;
+    profile_step!("list_all_triggers", conn, output, list_all_triggers(conn, &mut output))?;
+    profile_step!("list_all_grants", conn, output, list_all_grants(conn, &mut output))?;
+
+    if is_profiling() {
+        eprintln!("  DDL {:30} {:>8.1}ms", "TOTAL", total_start.elapsed().as_secs_f64() * 1000.0);
+    }
 
     Ok(output)
 }
@@ -398,7 +638,7 @@ fn list_domains(conn: &mut Connection, output: &mut String, db_info: &DbInfo) ->
 // ============================================================================
 // 7. TABLES
 // ============================================================================
-fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo) -> Result<(), Error> {
+fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo, bulk: &BulkMetadata) -> Result<(), Error> {
     // Get all user tables (not views)
     let sql = r#"
         SELECT r.RDB$RELATION_NAME, r.RDB$OWNER_NAME, r.RDB$RELATION_TYPE
@@ -407,10 +647,10 @@ fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo
           AND r.RDB$VIEW_BLR IS NULL
         ORDER BY r.RDB$RELATION_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut tables = Vec::new();
     for row in rows {
         tables.push((
@@ -420,89 +660,49 @@ fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo
         ));
     }
     drop(stmt);
-    
+
     for (table_name, owner_name, rel_type) in tables {
         output.push_str(&format!("\n/* Table: {}, Owner: {} */\n", table_name, owner_name));
-        
+
         // Global temporary table or regular table
-        if rel_type == Some(4) {
-            output.push_str(&format!("CREATE GLOBAL TEMPORARY TABLE {} (\n", quote_identifier(&table_name)));
-        } else if rel_type == Some(5) {
+        if rel_type == Some(4) || rel_type == Some(5) {
             output.push_str(&format!("CREATE GLOBAL TEMPORARY TABLE {} (\n", quote_identifier(&table_name)));
         } else {
             output.push_str(&format!("CREATE TABLE {} (\n", quote_identifier(&table_name)));
         }
-        
-        // Get columns
-        let col_sql = r#"
-            SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH,
-                   f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH,
-                   f.RDB$CHARACTER_SET_ID, rf.RDB$DEFAULT_SOURCE, rf.RDB$NULL_FLAG,
-                   f.RDB$COMPUTED_SOURCE, rf.RDB$FIELD_SOURCE, rf.RDB$COLLATION_ID,
-                   rf.RDB$GENERATOR_NAME, rf.RDB$IDENTITY_TYPE
-            FROM RDB$RELATION_FIELDS rf
-            JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-            WHERE rf.RDB$RELATION_NAME = ?
-            ORDER BY rf.RDB$FIELD_POSITION
-        "#;
-        
-        let mut stmt = conn.prepare(col_sql)?;
-        let cols = stmt.query((table_name.as_str(),))?;
-        
-        let mut columns = Vec::new();
-        for c in cols {
-            columns.push((
-                c.get::<String>(0).unwrap_or_default().trim().to_string(),
-                c.get::<i16>(1).unwrap_or(0),
-                c.get::<i16>(2).unwrap_or(0),
-                c.get::<i16>(3).unwrap_or(0),
-                c.get::<i16>(4).unwrap_or(0),
-                c.get::<i16>(5).unwrap_or(0),
-                c.get::<i16>(6).unwrap_or(0),
-                c.get::<Option<String>>(8).ok().flatten(),
-                c.get::<Option<i16>>(9).ok().flatten(),
-                c.get::<Option<String>>(10).ok().flatten(),
-                c.get::<String>(11).unwrap_or_default().trim().to_string(),
-                c.get::<Option<i16>>(12).ok().flatten(),
-                c.get::<Option<String>>(13).ok().flatten(),
-                c.get::<Option<i16>>(14).ok().flatten(),
-            ));
-        }
-        drop(stmt);
-        
+
+        // Get columns from pre-fetched bulk data (0 queries!)
+        let empty_cols = Vec::new();
+        let columns = bulk.table_columns.get(&table_name).unwrap_or(&empty_cols);
+
         let mut col_defs = Vec::new();
         for col in columns {
-            let (cname, ft, st, len, prec, scale, clen, def, nullf, comp, fsource, _coll_id, gen_name, ident_type) = col;
-            
-            let mut col_def = format!("        {}", quote_identifier(&cname));
-            
-            // Check if it's a domain (not a system domain)
+            let (ref cname, ft, st, len, prec, scale, clen, ref def, nullf, ref comp, ref fsource, _coll_id, ref gen_name, ident_type) = *col;
+
+            let mut col_def = format!("        {}", quote_identifier(cname));
+
             if !fsource.starts_with("RDB$") && !fsource.is_empty() {
-                col_def.push_str(&format!(" {}", quote_identifier(&fsource)));
+                col_def.push_str(&format!(" {}", quote_identifier(fsource)));
             } else {
-                // Format base type
                 let type_str = format_data_type(ft, st, len, prec, scale, clen, None, None);
                 col_def.push_str(&format!(" {}", type_str));
             }
-            
-            // Computed by
-            if let Some(ref c) = comp {
+
+            if let Some(c) = comp {
                 let trimmed = c.trim();
                 if !trimmed.is_empty() {
                     col_def.push_str(&format!(" COMPUTED BY {}", trimmed));
                 }
             }
-            
-            // Default
-            if let Some(ref d) = def {
+
+            if let Some(d) = def {
                 let trimmed = d.trim();
                 if !trimmed.is_empty() {
                     col_def.push_str(&format!(" {}", trimmed));
                 }
             }
-            
-            // GENERATED ALWAYS/BY DEFAULT AS IDENTITY
-            if let Some(ref _gen) = gen_name {
+
+            if let Some(_gen) = gen_name {
                 if let Some(ident) = ident_type {
                     let ident_str = match ident {
                         1 => "BY DEFAULT",
@@ -512,24 +712,61 @@ fn list_all_tables(conn: &mut Connection, output: &mut String, _db_info: &DbInfo
                     col_def.push_str(&format!(" GENERATED {} AS IDENTITY", ident_str));
                 }
             }
-            
-            // NOT NULL
+
             if nullf == Some(1) {
                 col_def.push_str(" NOT NULL");
             }
-            
+
             col_defs.push(col_def);
         }
-        
+
         output.push_str(&col_defs.join(",\n"));
-        
-        // Primary Keys and Unique constraints
-        list_table_constraints(conn, &table_name, output)?;
-        
+
+        // Primary Keys and Unique constraints (from pre-fetched bulk data)
+        list_table_constraints_bulk(&table_name, output, bulk);
+
         output.push_str("\n);\n");
     }
-    
+
     Ok(())
+}
+
+/// Output PK/UNIQUE constraints for a table using pre-fetched bulk data (0 queries)
+fn list_table_constraints_bulk(table_name: &str, output: &mut String, bulk: &BulkMetadata) {
+    let empty = Vec::new();
+    let constraints = bulk.table_constraints.get(table_name).unwrap_or(&empty);
+
+    for (cons_name, cons_type, idx_name) in constraints {
+        output.push_str(",\n");
+
+        // Only print constraint name if not INTEG_*
+        if !cons_name.starts_with("INTEG_") {
+            output.push_str(&format!("        CONSTRAINT {}", quote_identifier(cons_name)));
+        }
+
+        // Get columns from pre-fetched index segments
+        let empty_segs = Vec::new();
+        let cols = bulk.index_segments.get(idx_name.as_str()).unwrap_or(&empty_segs);
+        let col_list: Vec<String> = cols.iter().map(|c| quote_identifier(c)).collect();
+
+        if cons_type == "PRIMARY KEY" {
+            output.push_str(&format!(" PRIMARY KEY ({})", col_list.join(", ")));
+        } else {
+            output.push_str(&format!(" UNIQUE ({})", col_list.join(", ")));
+        }
+
+        // Check for descending index and custom index name
+        if let Some((idx_type, iname)) = bulk.index_info.get(idx_name.as_str()) {
+            if *idx_type == Some(1) || cons_name != iname.trim() {
+                if *idx_type == Some(1) {
+                    output.push_str(" USING DESCENDING");
+                }
+                if cons_name != iname.trim() {
+                    output.push_str(&format!(" INDEX {}", quote_identifier(iname.trim())));
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -582,8 +819,8 @@ fn list_functions_ods12_headers(_conn: &mut Connection, _output: &mut String) ->
 // ============================================================================
 // 10. PROCEDURE HEADERS
 // ============================================================================
-fn list_procedure_headers(conn: &mut Connection, output: &mut String, db_info: &DbInfo) -> Result<(), Error> {
-    // Get procedures with their source code to output CREATE OR ALTER PROCEDURE like ISQL
+fn list_procedure_headers(conn: &mut Connection, output: &mut String, db_info: &DbInfo, bulk: &BulkMetadata) -> Result<(), Error> {
+    // Get procedures with their source code (1 query - blobs fetched automatically)
     let sql = r#"
         SELECT p.RDB$PROCEDURE_NAME, p.RDB$OWNER_NAME, p.RDB$PROCEDURE_SOURCE
         FROM RDB$PROCEDURES p
@@ -608,59 +845,36 @@ fn list_procedure_headers(conn: &mut Connection, output: &mut String, db_info: &
     if !procs.is_empty() {
         output.push_str("\nSET TERM ^ ;\n\n");
 
+        let empty_params = Vec::new();
+
         for (proc_name, owner, source) in procs {
             output.push_str(&format!("/* Stored procedure: {}, Owner: {} */\n", proc_name, owner));
 
-            // Get parameters
-            let param_sql = r#"
-                SELECT p.RDB$PARAMETER_NAME, p.RDB$PARAMETER_TYPE, f.RDB$FIELD_TYPE,
-                       f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION,
-                       f.RDB$FIELD_SCALE, f.RDB$CHARACTER_LENGTH, p.RDB$NULL_FLAG,
-                       p.RDB$FIELD_SOURCE, f.RDB$CHARACTER_SET_ID
-                FROM RDB$PROCEDURE_PARAMETERS p
-                JOIN RDB$FIELDS f ON p.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-                WHERE p.RDB$PROCEDURE_NAME = ?
-                  AND p.RDB$PACKAGE_NAME IS NULL
-                ORDER BY p.RDB$PARAMETER_TYPE, p.RDB$PARAMETER_NUMBER
-            "#;
-
-            let mut stmt = conn.prepare(param_sql)?;
-            let params = stmt.query((proc_name.as_str(),))?;
+            // Get parameters from pre-fetched bulk data (0 queries!)
+            let params = bulk.proc_params.get(&proc_name).unwrap_or(&empty_params);
 
             let mut inputs = Vec::new();
             let mut outputs = Vec::new();
 
-            for p in params {
-                let pname = p.get::<String>(0).unwrap_or_default().trim().to_string();
-                let ptype = p.get::<i16>(1).unwrap_or(0);
-                let ft = p.get::<i16>(2).unwrap_or(0);
-                let st = p.get::<i16>(3).unwrap_or(0);
-                let len = p.get::<i16>(4).unwrap_or(0);
-                let prec = p.get::<i16>(5).unwrap_or(0);
-                let scale = p.get::<i16>(6).unwrap_or(0);
-                let clen = p.get::<i16>(7).unwrap_or(0);
-                let _nullf = p.get::<Option<i16>>(8).ok().flatten();
-                let csid = p.get::<Option<i16>>(10).ok().flatten();
-
-                let mut type_str = format_data_type(ft, st, len, prec, scale, clen, None, None);
+            for (pname, ptype, ft, st, len, prec, scale, clen, _nullf, csid) in params {
+                let mut type_str = format_data_type(*ft, *st, *len, *prec, *scale, *clen, None, None);
 
                 // Add character set for string types if different from database default
                 if let Some(cs) = csid {
-                    if cs > 0 && cs != db_info.default_charset_id && (ft == 14 || ft == 37) {
-                        let csname = db_info.get_charset_name(cs);
+                    if *cs > 0 && *cs != db_info.default_charset_id && (*ft == 14 || *ft == 37) {
+                        let csname = db_info.get_charset_name(*cs);
                         if !csname.is_empty() {
                             type_str.push_str(&format!(" CHARACTER SET {}", csname));
                         }
                     }
                 }
 
-                if ptype == 0 {
+                if *ptype == 0 {
                     inputs.push(format!("{} {}", pname, type_str));
                 } else {
                     outputs.push(format!("{} {}", pname, type_str));
                 }
             }
-            drop(stmt);
 
             // Output CREATE OR ALTER PROCEDURE like ISQL
             output.push_str(&format!("CREATE OR ALTER PROCEDURE {} ", quote_identifier(&proc_name)));
@@ -728,23 +942,23 @@ fn list_package_headers(conn: &mut Connection, output: &mut String) -> Result<()
 // ============================================================================
 // 12. INDEXES
 // ============================================================================
-fn list_indexes(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    // Query from ISQL - exclude indexes that are part of constraints
+fn list_indexes(conn: &mut Connection, output: &mut String, bulk: &BulkMetadata) -> Result<(), Error> {
+    // Query from ISQL - exclude indexes that are part of constraints (1 query only)
     let sql = r#"
         SELECT i.RDB$INDEX_NAME, i.RDB$RELATION_NAME, i.RDB$UNIQUE_FLAG, i.RDB$INDEX_TYPE
         FROM RDB$INDICES i
         JOIN RDB$RELATIONS r ON i.RDB$RELATION_NAME = r.RDB$RELATION_NAME
         WHERE (r.RDB$SYSTEM_FLAG IS NULL OR r.RDB$SYSTEM_FLAG <> 1)
           AND NOT EXISTS (
-              SELECT 1 FROM RDB$RELATION_CONSTRAINTS rc 
+              SELECT 1 FROM RDB$RELATION_CONSTRAINTS rc
               WHERE rc.RDB$INDEX_NAME = i.RDB$INDEX_NAME
           )
         ORDER BY i.RDB$RELATION_NAME, i.RDB$INDEX_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut idxs: Vec<(String, String, Option<i16>, Option<i16>)> = Vec::new();
     for row in rows {
         idxs.push((
@@ -755,53 +969,40 @@ fn list_indexes(conn: &mut Connection, output: &mut String) -> Result<(), Error>
         ));
     }
     drop(stmt);
-    
+
     if !idxs.is_empty() {
         output.push_str("\n/*  Index definitions for all user tables */\n\n");
-        
+
+        let empty_segs = Vec::new();
         for (iname, tname, unique, idx_type) in idxs {
             let unique_str = if unique == Some(1) { " UNIQUE" } else { "" };
             let desc_str = if idx_type == Some(1) { " DESCENDING" } else { "" };
-            
+
             output.push_str(&format!("CREATE{}{} INDEX {} ON {}",
                 unique_str, desc_str, quote_identifier(&iname), quote_identifier(&tname)));
-            
-            // Get index segments
-            let seg_sql = r#"
-                SELECT s.RDB$FIELD_NAME 
-                FROM RDB$INDEX_SEGMENTS s
-                WHERE s.RDB$INDEX_NAME = ?
-                ORDER BY s.RDB$FIELD_POSITION
-            "#;
-            
-            let mut stmt2 = conn.prepare(seg_sql)?;
-            let segs = stmt2.query((iname.as_str(),))?;
-            
-            let mut cols = Vec::new();
-            for seg in segs {
-                let col = seg.get::<String>(0).unwrap_or_default().trim().to_string();
-                cols.push(quote_identifier(&col));
-            }
-            drop(stmt2);
-            
+
+            // Get index segments from pre-fetched bulk data (0 queries!)
+            let cols: Vec<String> = bulk.index_segments.get(&iname).unwrap_or(&empty_segs)
+                .iter().map(|c| quote_identifier(c)).collect();
+
             if !cols.is_empty() {
                 output.push_str(&format!(" ({})", cols.join(", ")));
             }
-            
+
             output.push_str(";\n");
         }
     }
-    
+
     Ok(())
 }
 
 // ============================================================================
 // 13. FOREIGN KEYS
 // ============================================================================
-fn list_foreign(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    // Query from ISQL extract.epp - matches the exact logic
+fn list_foreign(conn: &mut Connection, output: &mut String, bulk: &BulkMetadata) -> Result<(), Error> {
+    // Query from ISQL extract.epp (1 query for all FKs)
     let sql = r#"
-        SELECT 
+        SELECT
             relc1.RDB$CONSTRAINT_NAME,
             relc1.RDB$RELATION_NAME,
             relc2.RDB$RELATION_NAME as ref_table,
@@ -815,10 +1016,10 @@ fn list_foreign(conn: &mut Connection, output: &mut String) -> Result<(), Error>
           AND (relc2.RDB$CONSTRAINT_TYPE = 'UNIQUE' OR relc2.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY')
         ORDER BY relc1.RDB$RELATION_NAME, relc1.RDB$CONSTRAINT_NAME
     "#;
-    
+
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query(())?;
-    
+
     let mut fks: Vec<FkInfo> = Vec::new();
     for row in rows {
         fks.push(FkInfo {
@@ -831,59 +1032,36 @@ fn list_foreign(conn: &mut Connection, output: &mut String) -> Result<(), Error>
         });
     }
     drop(stmt);
-    
+
     if !fks.is_empty() {
         output.push_str("\n");
-        
+        let empty_segs = Vec::new();
+
         for fk in fks {
             output.push_str(&format!("\nALTER TABLE {} ADD ", quote_identifier(&fk.table_name)));
-            
+
             // Constraint name if not INTEG_*
             if !fk.constraint_name.starts_with("INTEG_") {
                 output.push_str(&format!("CONSTRAINT {} ", quote_identifier(&fk.constraint_name)));
             }
-            
-            // Get source columns
-            let col_sql = r#"
-                SELECT s.RDB$FIELD_NAME 
-                FROM RDB$INDEX_SEGMENTS s
-                JOIN RDB$RELATION_CONSTRAINTS rc ON s.RDB$INDEX_NAME = rc.RDB$INDEX_NAME
-                WHERE rc.RDB$CONSTRAINT_NAME = ?
-                ORDER BY s.RDB$FIELD_POSITION
-            "#;
-            
-            let mut stmt2 = conn.prepare(col_sql)?;
-            let cols = stmt2.query((fk.constraint_name.as_str(),))?;
-            
-            let mut src_cols = Vec::new();
-            for c in cols {
-                src_cols.push(quote_identifier(&c.get::<String>(0).unwrap_or_default().trim()));
-            }
-            drop(stmt2);
-            
+
+            // Get source columns from pre-fetched data: constraint_name → index_name → index_segments
+            let src_cols: Vec<String> = bulk.constraint_index.get(&fk.constraint_name)
+                .and_then(|idx| bulk.index_segments.get(idx))
+                .unwrap_or(&empty_segs)
+                .iter().map(|c| quote_identifier(c)).collect();
+
             output.push_str(&format!("FOREIGN KEY ({})", src_cols.join(", ")));
             output.push_str(&format!(" REFERENCES {}", quote_identifier(&fk.ref_table)));
-            
-            // Get reference columns
-            let ref_col_sql = r#"
-                SELECT s.RDB$FIELD_NAME 
-                FROM RDB$INDEX_SEGMENTS s
-                JOIN RDB$RELATION_CONSTRAINTS rc ON s.RDB$INDEX_NAME = rc.RDB$INDEX_NAME
-                WHERE rc.RDB$CONSTRAINT_NAME = ?
-                ORDER BY s.RDB$FIELD_POSITION
-            "#;
-            
-            let mut stmt3 = conn.prepare(ref_col_sql)?;
-            let cols = stmt3.query((fk.ref_constraint.as_str(),))?;
-            
-            let mut ref_cols = Vec::new();
-            for c in cols {
-                ref_cols.push(quote_identifier(&c.get::<String>(0).unwrap_or_default().trim()));
-            }
-            drop(stmt3);
-            
+
+            // Get reference columns from pre-fetched data
+            let ref_cols: Vec<String> = bulk.constraint_index.get(&fk.ref_constraint)
+                .and_then(|idx| bulk.index_segments.get(idx))
+                .unwrap_or(&empty_segs)
+                .iter().map(|c| quote_identifier(c)).collect();
+
             output.push_str(&format!(" ({})", ref_cols.join(", ")));
-            
+
             // Update rule
             if let Some(ref rule) = fk.update_rule {
                 let trimmed = rule.trim();
@@ -891,7 +1069,7 @@ fn list_foreign(conn: &mut Connection, output: &mut String) -> Result<(), Error>
                     output.push_str(&format!(" ON UPDATE {}", trimmed));
                 }
             }
-            
+
             // Delete rule
             if let Some(ref rule) = fk.delete_rule {
                 let trimmed = rule.trim();
@@ -899,11 +1077,11 @@ fn list_foreign(conn: &mut Connection, output: &mut String) -> Result<(), Error>
                     output.push_str(&format!(" ON DELETE {}", trimmed));
                 }
             }
-            
+
             output.push_str(";\n");
         }
     }
-    
+
     Ok(())
 }
 
@@ -919,8 +1097,8 @@ struct FkInfo {
 // ============================================================================
 // 14. VIEWS
 // ============================================================================
-fn list_views(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
-    // First, collect all views info
+fn list_views(conn: &mut Connection, output: &mut String, bulk: &BulkMetadata) -> Result<(), Error> {
+    // Get all views (1 query - view source blobs fetched automatically)
     let sql_views = r#"
         SELECT r.RDB$RELATION_NAME, r.RDB$OWNER_NAME, r.RDB$VIEW_SOURCE
         FROM RDB$RELATIONS r
@@ -946,26 +1124,11 @@ fn list_views(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
     }
 
     output.push_str("\n/*  Views */\n\n");
+    let empty_cols = Vec::new();
 
-    // For each view, get columns and generate CREATE VIEW
+    // For each view, get columns from pre-fetched bulk data (0 queries!)
     for (name, owner, source) in views {
-        // Get view columns
-        let sql_cols = format!(r#"
-            SELECT RDB$FIELD_NAME
-            FROM RDB$RELATION_FIELDS
-            WHERE RDB$RELATION_NAME = '{}'
-            ORDER BY RDB$FIELD_POSITION
-        "#, name);
-
-        let mut columns: Vec<String> = Vec::new();
-        {
-            let mut stmt = conn.prepare(&sql_cols)?;
-            let rows = stmt.query(())?;
-            for row in rows {
-                let col = row.get::<String>(0).unwrap_or_default().trim().to_string();
-                columns.push(col);
-            }
-        }
+        let columns = bulk.view_columns.get(&name).unwrap_or(&empty_cols);
 
         // Generate CREATE VIEW statement
         output.push_str(&format!("/* View: {}, Owner: {} */\n", name, owner));
@@ -974,7 +1137,6 @@ fn list_views(conn: &mut Connection, output: &mut String) -> Result<(), Error> {
         output.push_str(") AS\n");
 
         if let Some(src) = source {
-            // Trim leading/trailing whitespace but preserve internal formatting
             let src = src.trim();
             output.push_str(src);
         }
@@ -1730,87 +1892,3 @@ fn get_charset_id(name: &str) -> i16 {
     }
 }
 
-/// List table constraints (PK, Unique)
-fn list_table_constraints(conn: &mut Connection, table_name: &str, output: &mut String) -> Result<(), Error> {
-    let sql = r#"
-        SELECT rc.RDB$CONSTRAINT_NAME, rc.RDB$CONSTRAINT_TYPE, rc.RDB$INDEX_NAME
-        FROM RDB$RELATION_CONSTRAINTS rc
-        WHERE rc.RDB$RELATION_NAME = ?
-          AND (rc.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY' OR rc.RDB$CONSTRAINT_TYPE = 'UNIQUE')
-        ORDER BY rc.RDB$CONSTRAINT_TYPE, rc.RDB$CONSTRAINT_NAME
-    "#;
-    
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query((table_name,))?;
-    
-    // Collect constraints first
-    let mut constraints = Vec::new();
-    for row in rows {
-        constraints.push((
-            row.get::<String>(0).unwrap_or_default().trim().to_string(),
-            row.get::<String>(1).unwrap_or_default().trim().to_string(),
-            row.get::<String>(2).unwrap_or_default().trim().to_string(),
-        ));
-    }
-    drop(stmt);
-    
-    for (cons_name, cons_type, idx_name) in constraints {
-        output.push_str(",\n");
-        
-        // Only print constraint name if not INTEG_*
-        if !cons_name.starts_with("INTEG_") {
-            output.push_str(&format!("        CONSTRAINT {}", quote_identifier(&cons_name)));
-        }
-        
-        // Get columns
-        let col_sql = r#"
-            SELECT s.RDB$FIELD_NAME
-            FROM RDB$INDEX_SEGMENTS s
-            WHERE s.RDB$INDEX_NAME = ?
-            ORDER BY s.RDB$FIELD_POSITION
-        "#;
-        
-        let mut stmt2 = conn.prepare(col_sql)?;
-        let cols = stmt2.query((idx_name.as_str(),))?;
-        
-        let mut col_list = Vec::new();
-        for c in cols {
-            col_list.push(quote_identifier(&c.get::<String>(0).unwrap_or_default().trim()));
-        }
-        drop(stmt2);
-        
-        if cons_type == "PRIMARY KEY" {
-            output.push_str(&format!(" PRIMARY KEY ({})", col_list.join(", ")));
-        } else {
-            output.push_str(&format!(" UNIQUE ({})", col_list.join(", ")));
-        }
-        
-        // Check for descending index
-        let idx_sql = r#"
-            SELECT i.RDB$INDEX_TYPE, i.RDB$INDEX_NAME
-            FROM RDB$INDICES i
-            WHERE i.RDB$INDEX_NAME = ?
-        "#;
-        
-        let mut stmt3 = conn.prepare(idx_sql)?;
-        let idx_rows = stmt3.query((idx_name.as_str(),))?;
-        
-        for idx_row in idx_rows {
-            let idx_type = idx_row.get::<Option<i16>>(0).ok().flatten();
-            let iname = idx_row.get::<String>(1).unwrap_or_default();
-            
-            if idx_type == Some(1) || cons_name != iname {
-                if idx_type == Some(1) {
-                    output.push_str(" USING DESCENDING");
-                }
-                if cons_name != iname {
-                    output.push_str(&format!(" INDEX {}", quote_identifier(&iname)));
-                }
-            }
-            break;
-        }
-        drop(stmt3);
-    }
-    
-    Ok(())
-}

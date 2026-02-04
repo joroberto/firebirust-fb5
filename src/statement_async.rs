@@ -121,23 +121,56 @@ impl StatementAsync<'_> {
 
     pub async fn query<P: Params>(&mut self, params: P) -> Result<Rows, Error> {
         params.__bind_in_async(self)?;
-        self.conn
-            ._execute_statement(
+        let mut rows: VecDeque<Vec<CellValue>> = VecDeque::new();
+
+        if self.stmt_type == ISC_INFO_SQL_STMT_SELECT {
+            // Pipeline execute+fetch: sends both ops before reading responses
+            let blr = self.calc_blr();
+            let (first_batch, more_data) = self.conn._execute_and_fetch(
+                self.trans_handle,
+                self.stmt_handle,
+                self.params.as_slice(),
+                &blr,
+                &self.xsqlda,
+            ).await?;
+            rows.extend(first_batch);
+
+            if more_data {
+                loop {
+                    let (batch, more) = self.conn._fetch(self.stmt_handle, &blr, &self.xsqlda).await?;
+                    rows.extend(batch);
+                    if !more { break; }
+                }
+            }
+
+            // Resolve blob references
+            for row in rows.iter_mut() {
+                for cell in row.iter_mut() {
+                    match cell {
+                        CellValue::BlobBinary(blob_id) => {
+                            let blob = self.conn._get_blob_segments(&blob_id, self.trans_handle).await;
+                            *cell = CellValue::BlobBinary(blob.unwrap_or_default());
+                        }
+                        CellValue::BlobText(blob_id) => {
+                            let blob = self.conn._get_blob_segments(&blob_id, self.trans_handle).await;
+                            *cell = CellValue::BlobText(blob.unwrap_or_default());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            self.conn._free_statement(self.stmt_handle, DSQL_CLOSE).await;
+        } else {
+            self.conn._execute_statement(
                 self.trans_handle,
                 self.stmt_handle,
                 self.stmt_type,
                 self.params.as_slice(),
-            )
-            .await?;
-        let mut rows: VecDeque<Vec<CellValue>> = VecDeque::new();
-        if self.stmt_type == ISC_INFO_SQL_STMT_SELECT {
-            rows = self.fetch_records(self.trans_handle).await?;
-            self.conn
-                ._free_statement(self.stmt_handle, DSQL_CLOSE)
-                .await;
-        } else if self.autocommit {
-            // commit automatically
-            self.conn.commit().await?;
+            ).await?;
+            if self.autocommit {
+                self.conn.commit().await?;
+            }
         }
 
         Ok(Rows::new(rows))
